@@ -7,9 +7,12 @@ import {
   calculateVacationDeadline,
   calcularDataLimiteCLT,
   decodeTabularFile,
+  getVacationLifecycleStatus,
   gerarProjecaoAutomatica,
+  isValidCpf,
   parseVacationImport,
   planVacationPrograms,
+  summarizeShiftCoverage,
   verificarMinimoOperacional,
 } from '../src/lib/vacationPlanning.ts';
 
@@ -29,6 +32,19 @@ test('safe deadline is 21 calendar months after the acquisition start', () => {
     legalLimit: '2025-12-01',
     safeDeadline: '2025-12-01',
   });
+});
+
+test('concession lifecycle status follows scheduled dates', () => {
+  assert.equal(getVacationLifecycleStatus(null, null, '2026-10-01'), 'Pendente');
+  assert.equal(getVacationLifecycleStatus('2026-10-10', '2026-10-23', '2026-10-01'), 'Agendada');
+  assert.equal(getVacationLifecycleStatus('2026-09-25', '2026-10-10', '2026-10-01'), 'Em Gozo');
+  assert.equal(getVacationLifecycleStatus('2026-09-01', '2026-09-14', '2026-10-01'), 'Concluída');
+});
+
+test('CPF validation accepts valid check digits and rejects repeated or invalid digits', () => {
+  assert.equal(isValidCpf('529.982.247-25'), true);
+  assert.equal(isValidCpf('52998224724'), false);
+  assert.equal(isValidCpf('11111111111'), false);
 });
 
 test('Portuguese CLT helper and capacity check use configured role and shift minimums', () => {
@@ -66,6 +82,19 @@ test('CSV/TSV parser normalizes headers and accepts multiple periods for one reg
   assert.equal(rows[0].program.employee.role, 'OPERADOR');
   assert.equal(rows[0].program.daysOff, 20);
   assert.equal(rows[1].program.daysOff, undefined);
+});
+
+test('eSocial import preserves CPF as digits and reports invalid CPF', () => {
+  const text = [
+    'MATRICULA;CPF;NOME;FUNCAO;SETOR;PLANTAO;TURNO;STATUS;PERIODO_AQUISITIVO_INICIO;PERIODO_AQUISITIVO_FIM',
+    '0017;529.982.247-25;MARIA;OPERADOR;GATE;D1;DIURNO;ATIVO;01/01/2025;31/12/2025',
+    '0018;111.111.111-11;JOSE;OPERADOR;GATE;D1;DIURNO;ATIVO;01/01/2025;31/12/2025',
+  ].join('\n');
+  const [valid, invalid] = parseVacationImport(text);
+  assert.equal(valid.program.employee.cpf, '52998224725');
+  assert.ok(valid.program);
+  assert.equal(invalid.program, null);
+  assert.match(invalid.errors.join(' '), /CPF inválido/);
 });
 
 test('Windows-1252 files decode correctly and missing identities are rejected', () => {
@@ -228,6 +257,51 @@ test('coverage gap summary reports daily shortages by role and shift', () => {
     disponiveis: 1,
     minimo: 2,
   }]);
+});
+
+test('daily shift summary reports available percentage, vacations, and minimum conflicts', () => {
+  const employees = [
+    { id: 'employee-1', registration: '1', name: 'ANA', role: 'OPERADOR', shift_group: 'D1', status: 'Ativo' },
+    { id: 'employee-2', registration: '2', name: 'BIA', role: 'OPERADOR', shift_group: 'D1', status: 'Ativo' },
+  ];
+  const assignments = employees.map((employee) => ({
+    employee_id: employee.id,
+    date: '2026-10-10',
+    shift_group: 'D1',
+    role: 'OPERADOR',
+    status: 'Escalado',
+  }));
+  const program = {
+    ...sampleProgram(),
+    employee_id: 'employee-2',
+    data_inicio_programada: '2026-10-10',
+    data_fim_programada: '2026-10-23',
+  };
+  const base = {
+    date: '2026-10-10',
+    employees,
+    assignments,
+    leaves: [],
+    programs: [program],
+  };
+  const [covered] = summarizeShiftCoverage({
+    ...base,
+    minimums: [{ id: 'min-1', funcao: 'OPERADOR', plantao: 'D1', minimo_operacional: 1 }],
+  });
+  assert.deepEqual({
+    escalados: covered.escalados,
+    disponiveis: covered.disponiveis,
+    emFerias: covered.emFerias,
+    percentualAtivo: covered.percentualAtivo,
+    status: covered.status,
+  }, { escalados: 2, disponiveis: 1, emFerias: 1, percentualAtivo: 50, status: 'OK' });
+
+  const [conflict] = summarizeShiftCoverage({
+    ...base,
+    minimums: [{ id: 'min-1', funcao: 'OPERADOR', plantao: 'D1', minimo_operacional: 2 }],
+  });
+  assert.equal(conflict.status, 'CONFLITO');
+  assert.equal(conflict.disponiveis, 1);
 });
 
 test('allocation stays pending without a configured minimum or daily roster', () => {

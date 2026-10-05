@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, CalendarDays, CalendarClock, Check, CheckCircle2, FileUp, Filter, LogIn, LogOut, RefreshCw, Save, Search, Settings2, ShieldAlert, Sparkles } from 'lucide-react';
+import { AlertTriangle, CalendarDays, CalendarClock, Check, CheckCircle2, Download, FileUp, Filter, LogIn, LogOut, Printer, RefreshCw, Save, Search, Settings2, ShieldAlert, Sparkles } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { EmptyState, PageHeader } from '@/components/ui/Layout';
 import { Input, Select, Textarea } from '@/components/ui/Form';
@@ -9,8 +9,11 @@ import {
   calculateCoverageGaps,
   calculateVacationDeadline,
   decodeTabularFile,
+  getVacationLifecycleStatus,
+  isValidCpf,
   parseVacationImport,
   planVacationPrograms,
+  summarizeShiftCoverage,
   type ParsedVacationRow,
   type VacationAssignment,
   type VacationEmployee,
@@ -18,6 +21,7 @@ import {
   type VacationMinimum,
   type VacationProgram,
 } from '@/lib/vacationPlanning';
+import type { VacationScheduleHistory } from '@/types/vocation';
 
 interface VacationProgrammingTabProps {
   employees: Employee[];
@@ -46,6 +50,10 @@ interface EmployeeWrite {
 function localToday(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+function displayDate(value: string): string {
+  return new Intl.DateTimeFormat('pt-BR', { timeZone: 'UTC' }).format(new Date(`${value}T00:00:00Z`));
 }
 
 function inclusiveDays(start: string, end: string): number {
@@ -85,10 +93,14 @@ type UrgencyFilter = 'all' | 'critical' | 'attention' | 'conflict' | 'scheduled'
 
 export function VacationTab({ employees, shiftScales, onDataChanged }: VacationProgrammingTabProps) {
   const today = useMemo(localToday, []);
+  const [selectedCoverageDate, setSelectedCoverageDate] = useState(localToday);
+  const [selectedMonth, setSelectedMonth] = useState(localToday().slice(0, 7));
   const [programs, setPrograms] = useState<VacationProgram[]>([]);
   const [minimums, setMinimums] = useState<VacationMinimum[]>([]);
   const [assignments, setAssignments] = useState<VacationAssignment[]>([]);
   const [leaves, setLeaves] = useState<VacationLeave[]>([]);
+  const [esocialByEmployee, setEsocialByEmployee] = useState<Record<string, string>>({});
+  const [scheduleHistory, setScheduleHistory] = useState<VacationScheduleHistory[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [dataAvailable, setDataAvailable] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
@@ -170,7 +182,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         supabase.from('vacation_schedules').select('*').order('dt_limite_maxima'),
         supabase.from('vacation_coverage_bases').select('*').order('funcao').order('plantao'),
         supabase.from('shift_assignments').select('employee_id,date,shift_group,role,status').gte('date', today).order('date').limit(10000),
-        supabase.from('leave_records').select('employee_id,start_date,end_date,status').order('start_date').limit(10000),
+        supabase.from('leave_records').select('employee_id,start_date,end_date,status,leave_type').order('start_date').limit(10000),
       ]);
       const failed = [programResult, minimumResult, assignmentResult, leaveResult].find((result) => result.error);
       if (failed?.error) {
@@ -185,13 +197,29 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
       setMinimums((minimumResult.data || []) as VacationMinimum[]);
       setAssignments((assignmentResult.data || []) as VacationAssignment[]);
       setLeaves((leaveResult.data || []) as VacationLeave[]);
+      if (isDp) {
+        const [esocialResult, historyResult] = await Promise.all([
+          supabase.from('employee_esocial_data').select('employee_id,cpf'),
+          supabase.from('vacation_schedule_history').select('*').order('occurred_at', { ascending: false }).limit(50),
+        ]);
+        const privateDataError = esocialResult.error || historyResult.error;
+        if (privateDataError) {
+          setError(`Falha ao carregar dados eSocial/histórico: ${privateDataError.message}. Confirme a migration e a autorização de DP.`);
+          return;
+        }
+        setEsocialByEmployee(Object.fromEntries((esocialResult.data || []).map((record) => [record.employee_id, record.cpf])));
+        setScheduleHistory((historyResult.data || []) as VacationScheduleHistory[]);
+      } else {
+        setEsocialByEmployee({});
+        setScheduleHistory([]);
+      }
       setDataAvailable(true);
     } catch (reason) {
       setError(`Falha de comunicação ao carregar dados da programação: ${errorMessage(reason)}`);
     } finally {
       setIsLoading(false);
     }
-  }, [today]);
+  }, [isDp, today]);
 
   useEffect(() => { void loadData(); }, [loadData]);
 
@@ -231,11 +259,13 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
   const invalidImportCount = preview.length - validImportRows.length;
   const criticalCount = programs.filter((program) => {
     const days = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
-    return days <= 30;
+    const lifecycle = getVacationLifecycleStatus(program.data_inicio_programada, program.data_fim_programada, today);
+    return lifecycle !== 'Concluída' && lifecycle !== 'Em Gozo' && days <= 30;
   }).length;
   const attentionCount = programs.filter((program) => {
     const days = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
-    return days > 30 && days <= 60;
+    const lifecycle = getVacationLifecycleStatus(program.data_inicio_programada, program.data_fim_programada, today);
+    return lifecycle !== 'Concluída' && lifecycle !== 'Em Gozo' && days > 30 && days <= 60;
   }).length;
   const validatedCount = planned.filter((item) =>
     item.status === 'PROGRAMADO' &&
@@ -252,13 +282,14 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
     const program = item.program;
     const employee = employees.find((candidate) => candidate.id === program.employee_id);
     const days = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+    const lifecycle = getVacationLifecycleStatus(program.data_inicio_programada, program.data_fim_programada, today);
     const isProjected = !program.ajuste_manual_flag && Boolean(program.data_inicio_programada && program.data_fim_programada);
     const urgencyMatches = urgencyFilter === 'all' ||
-      (urgencyFilter === 'critical' && days <= 30) ||
-      (urgencyFilter === 'attention' && days > 30 && days <= 60) ||
+      (urgencyFilter === 'critical' && lifecycle !== 'Concluída' && lifecycle !== 'Em Gozo' && days <= 30) ||
+      (urgencyFilter === 'attention' && lifecycle !== 'Concluída' && lifecycle !== 'Em Gozo' && days > 30 && days <= 60) ||
       (urgencyFilter === 'conflict' && (item.status === 'CONFLITO' || item.status === 'BLOQUEADO')) ||
       (urgencyFilter === 'scheduled' && item.status === 'PROGRAMADO' && Boolean(program.data_inicio_programada && program.data_fim_programada)) ||
-      (urgencyFilter === 'regular' && days > 30 && !isProjected) ||
+      (urgencyFilter === 'regular' && days > 60 && !isProjected) ||
       (urgencyFilter === 'projected' && isProjected);
     const group = employee?.shift_group || employee?.shift_type || '';
     const search = searchText.trim().toLocaleLowerCase('pt-BR');
@@ -270,6 +301,84 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
       (!filterRole || employee?.role === filterRole) &&
       textMatches;
   });
+  const calendarDates = useMemo(() => {
+    const [year, month] = selectedMonth.split('-').map(Number);
+    const dayCount = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    return Array.from({ length: dayCount }, (_, index) =>
+      `${selectedMonth}-${String(index + 1).padStart(2, '0')}`);
+  }, [selectedMonth]);
+  const programsForCoverage = useMemo(() => planned
+    .filter((item) => item.start && item.end)
+    .map((item) => ({
+      ...item.program,
+      data_inicio_programada: item.start,
+      data_fim_programada: item.end,
+    })), [planned]);
+  const monthlyCoverage = useMemo(() => new Map(calendarDates.map((date) => [
+    date,
+    summarizeShiftCoverage({
+      date,
+      employees: planningEmployees,
+      assignments,
+      leaves,
+      programs: programsForCoverage,
+      minimums,
+    }),
+  ])), [calendarDates, planningEmployees, assignments, leaves, programsForCoverage, minimums]);
+  const selectedCoverage = monthlyCoverage.get(selectedCoverageDate) || [];
+
+  const exportCsv = () => {
+    if (!isDp) {
+      setError('A exportação com dados eSocial é restrita ao DP autorizado.');
+      return;
+    }
+    const cell = (value: unknown) => {
+      let text = String(value ?? '');
+      if (/^[\t\r ]*[=+\-@]/.test(text)) text = `'${text}`;
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+    const rows = [
+      ['Matrícula', 'CPF', 'Nome', 'Função', 'Turno/Plantão', 'Início aquisitivo', 'Fim aquisitivo', 'Fim concessivo', 'Dias de gozo', 'Início de férias', 'Fim de férias', 'Status', 'Validação operacional', 'Observação DP'],
+      ...planned.map(({ program, start, end, status, message }) => {
+        const employee = employees.find((candidate) => candidate.id === program.employee_id);
+        return [
+          program.employee_id ? employee?.registration : '',
+          esocialByEmployee[program.employee_id] ? `'${esocialByEmployee[program.employee_id]}` : '',
+          employee?.name || '',
+          employee?.role || '',
+          employee?.shift_group || employee?.shift_type || '',
+          program.periodo_aquisitivo_inicio,
+          program.periodo_aquisitivo_fim,
+          program.periodo_concessivo_fim || program.dt_limite_maxima,
+          start && end ? inclusiveDays(start, end) : program.dias_gozo,
+          start || '',
+          end || '',
+          getVacationLifecycleStatus(start, end, today),
+          `${status}: ${message}`,
+          program.observacao_dp,
+        ];
+      }),
+    ];
+    const csv = `\uFEFF${rows.map((row) => row.map(cell).join(';')).join('\r\n')}`;
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `programacao-ferias-esocial-${today}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setError('');
+    setSuccess('Relatório CSV compatível com Excel exportado.');
+  };
+
+  const printReport = () => {
+    if (!isDp) {
+      setError('A impressão do relatório eSocial é restrita ao DP autorizado.');
+      return;
+    }
+    window.print();
+  };
 
   const handleFile = async (file?: File) => {
     setError('');
@@ -303,10 +412,19 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
       if (employeeReadError) throw new Error(`Falha ao consultar matrículas existentes: ${employeeReadError.message}`);
       const employeesByRegistration = new Map((existingEmployees || []).map((employee) => [employee.registration, employee as Employee]));
       const employeeWrites = new Map<string, EmployeeWrite>();
+      const importedCpfByRegistration = new Map<string, string>();
       const importErrors: string[] = [];
 
       for (const row of rows) {
         const source = row.program!.employee;
+        if (source.cpf) {
+          const previousCpf = importedCpfByRegistration.get(source.registration);
+          if (previousCpf && previousCpf !== source.cpf) {
+            importErrors.push(`Linha ${row.line} (${source.registration}): CPFs divergem entre períodos da mesma matrícula.`);
+            continue;
+          }
+          importedCpfByRegistration.set(source.registration, source.cpf);
+        }
         const existing = employeesByRegistration.get(source.registration);
         const previousWrite = employeeWrites.get(source.registration);
         const configuredScale = findSchedule(source.shiftGroup, shiftScales);
@@ -363,6 +481,18 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         throw new Error('O Supabase não retornou todas as matrículas após o upsert; os períodos de férias não foram gravados.');
       }
       const idsByRegistration = new Map((savedEmployees || []).map((employee) => [employee.registration, employee.id]));
+      const esocialWrites = [...importedCpfByRegistration.entries()].map(([registration, cpf]) => {
+        if (!isValidCpf(cpf)) throw new Error(`CPF inválido para a matrícula ${registration}.`);
+        const employeeId = idsByRegistration.get(registration);
+        if (!employeeId) throw new Error(`Matrícula ${registration} não retornou id_colaborador para o CPF.`);
+        return { employee_id: employeeId, cpf, updated_at: new Date().toISOString() };
+      });
+      if (esocialWrites.length > 0) {
+        const { error: esocialWriteError } = await supabase
+          .from('employee_esocial_data')
+          .upsert(esocialWrites, { onConflict: 'employee_id' });
+        if (esocialWriteError) throw new Error(`Colaboradores foram salvos, mas falhou a gravação protegida do CPF: ${esocialWriteError.message}`);
+      }
       const { data: oldPrograms, error: oldProgramReadError } = await supabase
         .from('vacation_schedules')
         .select('*')
@@ -389,6 +519,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
           periodo_aquisitivo_inicio: source.acquisitionStart,
           periodo_aquisitivo_fim: source.acquisitionEnd,
           dt_limite_maxima: source.safeDeadline,
+          status: getVacationLifecycleStatus(importedStart, importedEnd, today),
           dias_gozo: keepManual && source.daysOff === undefined ? old?.dias_gozo ?? 30 : source.daysOff ?? old?.dias_gozo ?? 30,
           data_inicio_programada: keepManual ? old?.data_inicio_programada ?? null : importedStart ?? old?.data_inicio_programada ?? null,
           data_fim_programada: keepManual ? old?.data_fim_programada ?? null : importedEnd ?? old?.data_fim_programada ?? null,
@@ -503,10 +634,17 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
     setShowSaveConfirmation(false);
     try {
       const payload = planned.map((item) => ({
-        ...item.program,
+        id: item.program.id,
+        employee_id: item.program.employee_id,
+        periodo_aquisitivo_inicio: item.program.periodo_aquisitivo_inicio,
+        periodo_aquisitivo_fim: item.program.periodo_aquisitivo_fim,
+        dt_limite_maxima: item.program.dt_limite_maxima,
         dias_gozo: item.start && item.end ? inclusiveDays(item.start, item.end) : item.program.dias_gozo,
         data_inicio_programada: item.start,
         data_fim_programada: item.end,
+        status: getVacationLifecycleStatus(item.start, item.end, today),
+        ajuste_manual_flag: item.program.ajuste_manual_flag,
+        observacao_dp: item.program.observacao_dp,
         updated_at: new Date().toISOString(),
       }));
       const { error: saveError } = await supabase
@@ -678,6 +816,129 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         </section>
       )}
 
+      <section className="rounded-xl border border-slate-700 bg-slate-800 p-5" aria-labelledby="shift-summary-title">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 id="shift-summary-title" className="font-semibold text-slate-100">Resumo operacional de plantões</h3>
+            <p className="mt-1 text-xs text-slate-400">Impacto diário das férias na cobertura por função e turno.</p>
+          </div>
+          <label className="text-xs text-slate-400">
+            Mês do cronograma
+            <input
+              type="month"
+              min={today.slice(0, 7)}
+              value={selectedMonth}
+              onChange={(event) => {
+                const nextMonth = event.target.value;
+                if (!nextMonth) return;
+                setSelectedMonth(nextMonth);
+                setSelectedCoverageDate(nextMonth === today.slice(0, 7) ? today : `${nextMonth}-01`);
+              }}
+              className="mt-1 block rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100"
+              aria-label="Mês do cronograma de plantões"
+            />
+          </label>
+        </div>
+        <div className="grid grid-cols-7 gap-1.5" role="grid" aria-label={`Calendário operacional de ${selectedMonth}`}>
+          {['D', 'S', 'T', 'Q', 'Q', 'S', 'S'].map((weekday, index) => (
+            <div key={`${weekday}-${index}`} className="py-1 text-center text-[10px] font-semibold text-slate-500">{weekday}</div>
+          ))}
+          {Array.from({ length: new Date(`${selectedMonth}-01T00:00:00Z`).getUTCDay() }, (_, index) => (
+            <div key={`blank-${index}`} aria-hidden="true" />
+          ))}
+          {calendarDates.map((date) => {
+            const rows = monthlyCoverage.get(date) || [];
+            const isConflict = rows.some((row) => row.status === 'CONFLITO');
+            const isPending = rows.length === 0 || rows.some((row) => row.status === 'PENDENTE');
+            const isPast = date < today;
+            const tone = isPast
+              ? 'border-slate-800 bg-slate-900/30 text-slate-600'
+              : isConflict
+                ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+                : isPending
+                  ? 'border-amber-500/30 bg-amber-500/5 text-amber-200'
+                  : 'border-emerald-500/30 bg-emerald-500/5 text-emerald-200';
+            return (
+              <button
+                key={date}
+                type="button"
+                role="gridcell"
+                disabled={isPast}
+                onClick={() => setSelectedCoverageDate(date)}
+                aria-pressed={selectedCoverageDate === date}
+                aria-label={`${displayDate(date)}: ${isConflict ? 'conflito de cobertura' : isPending ? 'cobertura pendente' : 'cobertura validada'}`}
+                className={`min-h-14 rounded-lg border p-1.5 text-left transition hover:brightness-125 disabled:cursor-default ${tone} ${selectedCoverageDate === date ? 'ring-2 ring-sky-400' : ''}`}
+              >
+                <span className="text-xs font-semibold">{Number(date.slice(-2))}</span>
+                <span className="mt-1 block text-[9px] leading-tight">
+                  {isPast ? 'passado' : isConflict ? 'conflito' : isPending ? 'pendente' : `${rows.length} grupos OK`}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-3 flex flex-wrap gap-3 text-[10px] text-slate-400" aria-label="Legenda de cobertura">
+          <span className="text-emerald-300">Verde · cobertura validada</span>
+          <span className="text-amber-300">Amarelo · escala/mínimo pendente</span>
+          <span className="text-rose-300">Vermelho · abaixo do mínimo</span>
+        </div>
+
+        <div className="mt-5 border-t border-slate-700 pt-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h4 className="text-sm font-semibold text-slate-100">Plantões em {displayDate(selectedCoverageDate)}</h4>
+              <p className="mt-1 text-xs text-slate-400">Ativos na escala diária · férias programadas · mínimo operacional.</p>
+            </div>
+            {isDp && (
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={exportCsv} className="inline-flex items-center gap-2 rounded-lg border border-slate-600 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700">
+                  <Download size={14} /> CSV / Excel
+                </button>
+                <button type="button" onClick={printReport} className="inline-flex items-center gap-2 rounded-lg border border-slate-600 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700">
+                  <Printer size={14} /> Imprimir / PDF
+                </button>
+              </div>
+            )}
+          </div>
+          {selectedCoverage.length === 0 ? (
+            <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-200">Sem colaboradores ativos com função e plantão cadastrados para resumir.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[680px] text-left text-xs">
+                <thead className="text-[10px] uppercase tracking-wide text-slate-500">
+                  <tr>
+                    <th className="px-3 py-2">Plantão</th>
+                    <th className="px-3 py-2">Função</th>
+                    <th className="px-3 py-2">Escalados</th>
+                    <th className="px-3 py-2">Ativos</th>
+                    <th className="px-3 py-2">Em férias</th>
+                    <th className="px-3 py-2">Mínimo</th>
+                    <th className="px-3 py-2">Cobertura</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-700">
+                  {selectedCoverage.map((row) => (
+                    <tr key={`${row.plantao}-${row.funcao}`}>
+                      <td className="px-3 py-2 font-semibold text-slate-200">{row.plantao}</td>
+                      <td className="px-3 py-2 text-slate-300">{row.funcao}</td>
+                      <td className="px-3 py-2 text-slate-300">{row.escalados}</td>
+                      <td className="px-3 py-2 font-semibold text-slate-100">
+                        {row.percentualAtivo === null ? '—' : `${row.percentualAtivo}% (${row.disponiveis}/${row.escalados})`}
+                      </td>
+                      <td className="px-3 py-2 text-slate-300">{row.emFerias}</td>
+                      <td className="px-3 py-2 text-slate-300">{row.minimo ?? 'não configurado'}</td>
+                      <td className={`px-3 py-2 font-semibold ${row.status === 'OK' ? 'text-emerald-300' : row.status === 'CONFLITO' ? 'text-rose-300' : 'text-amber-300'}`}>
+                        {row.status === 'OK' ? 'OK' : row.status === 'CONFLITO' ? 'Abaixo do mínimo' : 'Pendente'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </section>
+
       <section className="rounded-xl border border-slate-700 bg-slate-800 p-4">
         <div className="mb-3 flex items-center gap-2 text-slate-300">
           <Filter size={16} />
@@ -753,7 +1014,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
           <EmptyState message="Nenhum período corresponde aos filtros selecionados." />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1100px] text-sm">
+            <table className="w-full min-w-[1260px] text-sm">
               <thead className="bg-slate-900/70 text-left text-[10px] uppercase tracking-wide text-slate-400">
                 <tr>
                   <th className="px-4 py-3">Colaborador / matrícula</th>
@@ -763,6 +1024,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
                   <th className="px-4 py-3">Dias</th>
                   <th className="px-4 py-3">Início</th>
                   <th className="px-4 py-3">Fim</th>
+                  <th className="px-4 py-3">Status da concessão</th>
                   <th className="px-4 py-3">Situação</th>
                   <th className="px-4 py-3">Observação DP</th>
                 </tr>
@@ -773,18 +1035,22 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
                   const employee = employees.find((candidate) => candidate.id === program.employee_id);
                   const legalLimit = calculateVacationDeadline(program.periodo_aquisitivo_inicio).legalLimit;
                   const deadlineDays = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
-                  const urgency = deadlineDays <= 30 ? 'critical' : deadlineDays <= 60 ? 'attention' : 'ontime';
+                  const lifecycleStatus = getVacationLifecycleStatus(item.start, item.end, today);
+                  const urgency = lifecycleStatus === 'Concluída' || lifecycleStatus === 'Em Gozo'
+                    ? 'ontime'
+                    : deadlineDays <= 30 ? 'critical' : deadlineDays <= 60 ? 'attention' : 'ontime';
                   const dueWithoutSchedule = (
-                    !program.data_inicio_programada ||
-                    !program.data_fim_programada ||
+                    !item.start ||
+                    !item.end ||
                     item.status === 'CONFLITO' ||
                     item.status === 'BLOQUEADO'
                   ) && deadlineDays <= 30;
                   return (
-                    <tr key={program.id} className={`align-top hover:bg-slate-900/30 ${deadlineDays < 0 ? 'bg-rose-950/35' : dueWithoutSchedule ? 'bg-amber-950/20' : ''}`}>
+                    <tr key={program.id} className={`align-top hover:bg-slate-900/30 ${urgency === 'critical' && deadlineDays < 0 ? 'bg-rose-950/35' : dueWithoutSchedule ? 'bg-amber-950/20' : ''}`}>
                       <td className="px-4 py-3">
                         <p className="font-medium text-slate-100">{employee?.name || 'Colaborador não encontrado'}</p>
                         <p className="mt-1 text-[11px] text-slate-500">Mat. {employee?.registration || '—'}</p>
+                        {isDp && <p className="mt-1 text-[10px] text-slate-500">CPF {esocialByEmployee[program.employee_id] || 'não cadastrado'}</p>}
                         <span className={`mt-1 inline-flex rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${program.ajuste_manual_flag ? 'bg-sky-500/15 text-sky-200' : program.data_inicio_programada ? 'bg-violet-500/15 text-violet-200' : 'bg-slate-700 text-slate-400'}`}>
                           {program.ajuste_manual_flag ? 'Ajuste Manual DP' : program.data_inicio_programada ? 'Sugerido via algoritmo' : 'Sem ajuste manual'}
                         </span>
@@ -794,7 +1060,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
                       <td className={`px-4 py-3 text-xs ${urgency === 'critical' ? 'text-rose-200' : urgency === 'attention' ? 'text-amber-200' : 'text-slate-300'}`}>
                         <span className="inline-flex items-center gap-1.5">
                           {urgency === 'critical' && <AlertTriangle size={13} className={deadlineDays < 0 ? 'animate-pulse' : ''} aria-label={deadlineDays < 0 ? 'Prazo vencido' : 'Prazo crítico'} />}
-                          {program.dt_limite_maxima}
+                          {program.periodo_concessivo_fim || program.dt_limite_maxima}
                           <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase ${urgency === 'critical' ? 'bg-rose-500/20 text-rose-200' : urgency === 'attention' ? 'bg-amber-500/20 text-amber-200' : 'bg-emerald-500/10 text-emerald-200'}`}>
                             {deadlineDays < 0 ? 'Vencido' : urgency === 'critical' ? 'Crítico' : urgency === 'attention' ? 'Atenção' : 'Em dia'}
                           </span>
@@ -810,6 +1076,11 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
                       </td>
                       <td className="px-3 py-3">
                         <input type="date" value={program.data_fim_programada || ''} disabled={!isDp} onChange={(event) => updateProgram(program.id, { data_fim_programada: event.target.value || null, dias_gozo: program.data_inicio_programada && event.target.value ? inclusiveDays(program.data_inicio_programada, event.target.value) : program.dias_gozo, ajuste_manual_flag: Boolean(event.target.value || program.data_inicio_programada) })} className={`w-36 rounded-md border bg-slate-900 px-2 py-1.5 text-xs text-slate-100 disabled:opacity-60 ${item.status === 'CONFLITO' ? 'border-rose-500' : 'border-slate-600'}`} aria-label={`Fim programado para ${employee?.name || program.employee_id}`} aria-invalid={item.status === 'CONFLITO'} title={item.message} />
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex rounded-full px-2 py-1 text-[10px] font-semibold ${lifecycleStatus === 'Concluída' ? 'bg-slate-700 text-slate-300' : lifecycleStatus === 'Em Gozo' ? 'bg-sky-500/15 text-sky-200' : lifecycleStatus === 'Agendada' ? 'bg-emerald-500/10 text-emerald-200' : 'bg-amber-500/10 text-amber-200'}`}>
+                          {lifecycleStatus}
+                        </span>
                       </td>
                       <td className="px-4 py-3">
                         <span className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-bold ${item.status === 'PROGRAMADO' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : item.status === 'CONFLITO' || item.status === 'BLOQUEADO' ? 'border-rose-500/30 bg-rose-500/10 text-rose-300' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'}`}>{item.status}</span>
@@ -831,6 +1102,78 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         <AlertTriangle size={14} className="mt-0.5 shrink-0" />
         <span>A contagem considera apenas escalas diárias cadastradas como Escalado/Cobertura/Trabalho e afastamentos pendentes ou aprovados. Sem escala diária completa, o resultado fica pendente. Um ajuste manual não ignora a cobertura mínima.</span>
       </p>
+
+      {isDp && (
+        <section className="rounded-xl border border-slate-700 bg-slate-800 p-5" aria-labelledby="vacation-history-title">
+          <div className="mb-3 flex items-center gap-2">
+            <CalendarClock size={17} className="text-sky-300" />
+            <h3 id="vacation-history-title" className="text-sm font-semibold text-slate-100">Histórico de concessões</h3>
+            <span className="text-xs text-slate-500">últimas 50 alterações</span>
+          </div>
+          {scheduleHistory.length === 0 ? (
+            <p className="text-xs text-slate-400">Nenhuma alteração auditada ainda.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[620px] text-left text-xs">
+                <thead className="text-[10px] uppercase tracking-wide text-slate-500">
+                  <tr><th className="px-3 py-2">Data</th><th className="px-3 py-2">Ação</th><th className="px-3 py-2">Período concessivo</th><th className="px-3 py-2">Responsável</th></tr>
+                </thead>
+                <tbody className="divide-y divide-slate-700">
+                  {scheduleHistory.map((entry) => {
+                    const snapshot = entry.new_data || entry.old_data;
+                    const concessionEnd = snapshot?.['periodo_concessivo_fim'] || snapshot?.['dt_limite_maxima'] || '—';
+                    return (
+                      <tr key={entry.id}>
+                        <td className="px-3 py-2 text-slate-300">{new Date(entry.occurred_at).toLocaleString('pt-BR')}</td>
+                        <td className="px-3 py-2 font-semibold text-slate-200">{entry.operation}</td>
+                        <td className="px-3 py-2 text-slate-300">{String(concessionEnd)}</td>
+                        <td className="px-3 py-2 text-slate-400">{entry.actor_email}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {isDp && (
+        <section id="vacation-print-report" className="print-only" aria-label="Relatório para contabilidade e eSocial">
+          <h1>Programação de Férias — SGO UNILINK</h1>
+          <p>Emitido em {displayDate(today)} · Relatório para conferência do RH/DP e contabilidade.</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Matrícula</th><th>CPF</th><th>Nome</th><th>Função</th><th>Plantão</th>
+                <th>Período aquisitivo</th><th>Fim concessivo</th><th>Dias</th>
+                <th>Início</th><th>Fim</th><th>Status</th><th>Validação</th>
+              </tr>
+            </thead>
+            <tbody>
+              {planned.map(({ program, start, end, status, message }) => {
+                const employee = employees.find((candidate) => candidate.id === program.employee_id);
+                return (
+                  <tr key={program.id}>
+                    <td>{employee?.registration || ''}</td>
+                    <td>{esocialByEmployee[program.employee_id] || ''}</td>
+                    <td>{employee?.name || ''}</td>
+                    <td>{employee?.role || ''}</td>
+                    <td>{employee?.shift_group || employee?.shift_type || ''}</td>
+                    <td>{program.periodo_aquisitivo_inicio} — {program.periodo_aquisitivo_fim}</td>
+                    <td>{program.periodo_concessivo_fim || program.dt_limite_maxima}</td>
+                    <td>{start && end ? inclusiveDays(start, end) : program.dias_gozo}</td>
+                    <td>{start || ''}</td>
+                    <td>{end || ''}</td>
+                    <td>{getVacationLifecycleStatus(start, end, today)}</td>
+                    <td>{status}: {message}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </section>
+      )}
     </div>
   );
 }

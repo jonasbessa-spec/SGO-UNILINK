@@ -1,5 +1,4 @@
 import { type SelectHTMLAttributes, type InputHTMLAttributes } from 'react';
-import { Search } from 'lucide-react';
 
 interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
   label?: string;
@@ -34,24 +33,6 @@ export function Input({ label, className = '', ...props }: InputProps) {
       {label && <label className="text-xs font-medium text-slate-400">{label}</label>}
       <input
         className={`px-3 py-2 text-sm border border-slate-600 rounded-lg bg-slate-800 text-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500/50 transition-all ${className}`}
-        {...props}
-      />
-    </div>
-  );
-}
-
-interface SearchInputProps extends InputHTMLAttributes<HTMLInputElement> {
-  placeholder?: string;
-}
-
-export function SearchInput({ placeholder = 'Pesquisar...', className = '', ...props }: SearchInputProps) {
-  return (
-    <div className="relative">
-      <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-      <input
-        type="text"
-        placeholder={placeholder}
-        className={`pl-9 pr-3 py-2 text-sm border border-slate-600 rounded-lg bg-slate-800 text-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500/50 transition-all w-full ${className}`}
         {...props}
       />
     </div>

@@ -1,11 +1,13 @@
 import type {
   CapacityCheckResult,
   VacationCoverageBase,
+  VacationLifecycleStatus,
   VacationSchedule,
 } from '../types/vocation.ts';
 
 export interface VacationEmployeeImport {
   registration: string;
+  cpf?: string;
   name: string;
   role: string;
   sector?: string;
@@ -42,9 +44,11 @@ export interface VacationProgram {
   periodo_aquisitivo_inicio: string;
   periodo_aquisitivo_fim: string;
   dt_limite_maxima: string;
+  periodo_concessivo_fim?: string;
   dias_gozo: number;
   data_inicio_programada: string | null;
   data_fim_programada: string | null;
+  status?: VacationLifecycleStatus;
   ajuste_manual_flag: boolean;
   observacao_dp: string;
 }
@@ -52,6 +56,7 @@ export interface VacationProgram {
 export interface VacationEmployee {
   id: string;
   registration: string;
+  cpf?: string | null;
   name: string;
   role: string;
   shift_group: string;
@@ -81,6 +86,7 @@ export interface VacationLeave {
   start_date: string;
   end_date: string;
   status: string;
+  leave_type?: string;
 }
 
 export interface PlannedVacation {
@@ -97,6 +103,18 @@ export interface CoverageGap {
   plantao: string;
   disponiveis: number;
   minimo: number;
+}
+
+export interface ShiftDailyCoverage {
+  date: string;
+  funcao: string;
+  plantao: string;
+  escalados: number;
+  disponiveis: number;
+  emFerias: number;
+  minimo: number | null;
+  percentualAtivo: number | null;
+  status: 'OK' | 'CONFLITO' | 'PENDENTE';
 }
 
 export interface OperationalCoverageInput {
@@ -228,6 +246,31 @@ export function addCalendarDays(date: string, days: number): string {
   return result.toISOString().slice(0, 10);
 }
 
+export function getVacationLifecycleStatus(
+  start: string | null,
+  end: string | null,
+  today: string,
+): VacationLifecycleStatus {
+  if (!start || !end) return 'Pendente';
+  if (end < today) return 'Concluída';
+  if (start <= today) return 'Em Gozo';
+  return 'Agendada';
+}
+
+export function isValidCpf(value: string): boolean {
+  const digits = value.replace(/\D/g, '');
+  if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
+  const calculateDigit = (length: number) => {
+    const sum = digits.slice(0, length).split('').reduce(
+      (total, digit, index) => total + Number(digit) * (length + 1 - index),
+      0,
+    );
+    const remainder = (sum * 10) % 11;
+    return remainder === 10 ? 0 : remainder;
+  };
+  return calculateDigit(9) === Number(digits[9]) && calculateDigit(10) === Number(digits[10]);
+}
+
 export function calculateVacationDeadline(acquisitionStart: string): {
   twentyOneMonthCap: string;
   legalLimit: string;
@@ -305,6 +348,7 @@ function normalizedStatus(value: string): string {
 
 const HEADER_ALIASES: Record<string, string[]> = {
   registration: ['MATRICULA', 'MATRICULA_FUNCIONAL', 'REGISTRATION'],
+  cpf: ['CPF', 'NUMERO_CPF'],
   name: ['NOME', 'NOME_DO_COLABORADOR', 'COLABORADOR'],
   role: ['FUNCAO', 'CARGO', 'ROLE'],
   sector: ['SETOR', 'AREA', 'SECTOR'],
@@ -316,7 +360,7 @@ const HEADER_ALIASES: Record<string, string[]> = {
   hireDate: ['ADMISSAO', 'DATA_ADMISSAO', 'HIRE_DATE'],
   acquisitionStart: ['PERIODO_AQUISITIVO_INICIO', 'INICIO_PERIODO_AQUISITIVO'],
   acquisitionEnd: ['PERIODO_AQUISITIVO_FIM', 'FIM_PERIODO_AQUISITIVO'],
-  importedDeadline: ['DT_LIMITE_MAXIMA', 'DATA_LIMITE_MAXIMA'],
+  importedDeadline: ['DT_LIMITE_MAXIMA', 'DATA_LIMITE_MAXIMA', 'PERIODO_CONCESSIVO_FIM', 'FIM_PERIODO_CONCESSIVO'],
   daysOff: ['DIAS_GOZO', 'DURACAO_DIAS', 'DIAS_DE_FERIAS'],
   scheduledStart: ['DATA_INICIO_PROGRAMADA', 'FERIAS_INICIO_PROGRAMADA'],
   scheduledEnd: ['DATA_FIM_PROGRAMADA', 'FERIAS_FIM_PROGRAMADA'],
@@ -359,6 +403,8 @@ export function parseVacationImport(text: string): ParsedVacationRow[] {
     const errors: string[] = [];
     const warnings: string[] = [];
     const registration = cleanText(getCell(row, indexes, 'registration'));
+    const rawCpf = getCell(row, indexes, 'cpf');
+    const cpf = rawCpf ? rawCpf.replace(/\D/g, '') : undefined;
     const name = cleanText(getCell(row, indexes, 'name'));
     const role = cleanText(getCell(row, indexes, 'role'));
     const shiftGroup = cleanText(getCell(row, indexes, 'shiftGroup'));
@@ -378,6 +424,8 @@ export function parseVacationImport(text: string): ParsedVacationRow[] {
     const daysOff = rawDays ? Number(rawDays.replace(',', '.')) : undefined;
 
     if (!registration) errors.push('Matrícula obrigatória; a linha não será conciliada por nome.');
+    if (rawCpf && (!cpf || !isValidCpf(cpf))) errors.push('CPF inválido; informe um CPF válido com 11 dígitos.');
+    if (!rawCpf) warnings.push('CPF não informado; complete o cadastro eSocial para exportação contábil.');
     if (!name) errors.push('Nome obrigatório.');
     if (!role) errors.push('Função obrigatória.');
     if (!shiftGroup && !shiftType) errors.push('Informe plantão ou turno/classificação.');
@@ -451,6 +499,7 @@ export function parseVacationImport(text: string): ParsedVacationRow[] {
       scheduledEnd,
       employee: {
         registration,
+        cpf,
         name,
         role,
         sector,
@@ -841,4 +890,88 @@ export function calculateCoverageGaps(input: {
     first.date.localeCompare(second.date) ||
     first.funcao.localeCompare(second.funcao) ||
     first.plantao.localeCompare(second.plantao));
+}
+
+export function summarizeShiftCoverage(input: {
+  date: string;
+  employees: VacationEmployee[];
+  assignments: VacationAssignment[];
+  leaves: VacationLeave[];
+  programs: VacationProgram[];
+  minimums: VacationMinimum[];
+}): ShiftDailyCoverage[] {
+  const { date, employees, assignments, leaves, programs, minimums } = input;
+  const employeesById = new Map(employees.map((employee) => [employee.id, employee]));
+  const groups = new Map<string, { funcao: string; plantao: string; activeIds: Set<string>; assignedIds: Set<string> }>();
+  const slotKey = (role: string, shift: string) => key(role, shift);
+  const ensureGroup = (role: string, shift: string) => {
+    const groupKey = slotKey(role, shift);
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = { funcao: cleanText(role), plantao: cleanText(shift), activeIds: new Set(), assignedIds: new Set() };
+      groups.set(groupKey, group);
+    }
+    return group;
+  };
+
+  for (const employee of employees) {
+    if (!['ATIVO', 'FERIAS'].includes(normalizeHeader(employee.status))) continue;
+    const role = cleanText(employee.role);
+    const shift = cleanText(employee.shift_group || employee.shift_type || '');
+    if (role && shift) ensureGroup(role, shift).activeIds.add(employee.id);
+  }
+  for (const assignment of assignments) {
+    if (assignment.date !== date || !isWorkingStatus(assignment.status)) continue;
+    const employee = employeesById.get(assignment.employee_id);
+    if (!employee || normalizeHeader(employee.status) !== 'ATIVO') continue;
+    const role = cleanText(assignment.role || employee.role);
+    const shift = cleanText(assignment.shift_group || employee.shift_group || employee.shift_type || '');
+    if (role && shift) ensureGroup(role, shift).assignedIds.add(employee.id);
+  }
+
+  const absences = new Set<string>();
+  const vacations = new Set<string>();
+  for (const leave of leaves) {
+    if (normalizeHeader(leave.status) === 'RECUSADO' || leave.start_date > date || leave.end_date < date) continue;
+    absences.add(leave.employee_id);
+    if (normalizeHeader(leave.leave_type || '') === 'FERIAS') vacations.add(leave.employee_id);
+  }
+  for (const program of programs) {
+    if (program.data_inicio_programada && program.data_fim_programada &&
+      program.data_inicio_programada <= date && program.data_fim_programada >= date) {
+      absences.add(program.employee_id);
+      vacations.add(program.employee_id);
+    }
+  }
+
+  const minimumByKey = new Map(minimums.map((minimum) => [
+    slotKey(minimum.funcao, minimum.plantao),
+    minimum.minimo_operacional,
+  ]));
+  return [...groups.values()]
+    .map((group) => {
+      const minimum = minimumByKey.get(slotKey(group.funcao, group.plantao));
+      const availableIds = [...group.assignedIds].filter((id) => !absences.has(id));
+      const vacationCount = [...group.activeIds].filter((id) => vacations.has(id)).length;
+      const status = minimum === undefined || group.assignedIds.size === 0
+        ? 'PENDENTE'
+        : availableIds.length < minimum
+          ? 'CONFLITO'
+          : 'OK';
+      return {
+        date,
+        funcao: group.funcao,
+        plantao: group.plantao,
+        escalados: group.assignedIds.size,
+        disponiveis: availableIds.length,
+        emFerias: vacationCount,
+        minimo: minimum ?? null,
+        percentualAtivo: group.assignedIds.size > 0
+          ? Math.round((availableIds.length / group.assignedIds.size) * 100)
+          : null,
+        status,
+      } satisfies ShiftDailyCoverage;
+    })
+    .sort((first, second) =>
+      first.plantao.localeCompare(second.plantao) || first.funcao.localeCompare(second.funcao));
 }

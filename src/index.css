@@ -35,3 +35,28 @@ button:disabled { cursor: not-allowed; }
 main { animation: slide-in 0.35s ease-out; }
 
 input[type='date']::-webkit-calendar-picker-indicator { opacity: 0.6; }
+
+.print-only { display: none; }
+
+@page { size: landscape; margin: 12mm; }
+
+@media print {
+  body * { visibility: hidden !important; }
+  #vacation-print-report,
+  #vacation-print-report * { visibility: visible !important; }
+  #vacation-print-report {
+    display: block !important;
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    color: #111827;
+    background: #fff;
+    font: 10pt Arial, sans-serif;
+  }
+  #vacation-print-report h1 { font-size: 18pt; margin: 0 0 6pt; }
+  #vacation-print-report p { margin: 0 0 12pt; }
+  #vacation-print-report table { width: 100%; border-collapse: collapse; }
+  #vacation-print-report th,
+  #vacation-print-report td { border: 1px solid #9ca3af; padding: 4pt; text-align: left; }
+  #vacation-print-report th { background: #e5e7eb; }
+}

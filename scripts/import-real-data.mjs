@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const aliases = {
   registration: ['MATRICULA', 'MATRICULA_FUNCIONAL', 'REGISTRATION'],
+  cpf: ['CPF', 'NUMERO_CPF'],
   name: ['NOME', 'NOME_DO_COLABORADOR', 'COLABORADOR'],
   role: ['FUNCAO', 'CARGO', 'ROLE'],
   sector: ['SETOR', 'AREA', 'SECTOR'],
@@ -12,7 +13,7 @@ const aliases = {
   hireDate: ['ADMISSAO', 'DATA_ADMISSAO', 'HIRE_DATE'],
   periodStart: ['PERIODO_AQUISITIVO_INICIO', 'INICIO_PERIODO_AQUISITIVO'],
   periodEnd: ['PERIODO_AQUISITIVO_FIM', 'FIM_PERIODO_AQUISITIVO'],
-  importedDeadline: ['DT_LIMITE_MAXIMA', 'DATA_LIMITE_MAXIMA'],
+  importedDeadline: ['DT_LIMITE_MAXIMA', 'DATA_LIMITE_MAXIMA', 'PERIODO_CONCESSIVO_FIM', 'FIM_PERIODO_CONCESSIVO'],
   daysOff: ['DIAS_GOZO', 'DURACAO_DIAS', 'DIAS_DE_FERIAS'],
   scheduledStart: ['DATA_INICIO_PROGRAMADA'],
   scheduledEnd: ['DATA_FIM_PROGRAMADA'],
@@ -57,9 +58,23 @@ function addDays(date, days) {
   return result.toISOString().slice(0, 10);
 }
 
-function safeDeadline(periodEnd) {
-  const cap = addMonths(periodEnd, 21);
-  const legalLimit = addMonths(periodEnd, 22);
+function isValidCpf(value) {
+  const digits = value.replace(/\D/g, '');
+  if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
+  const calculateDigit = (length) => {
+    const sum = digits.slice(0, length).split('').reduce(
+      (total, digit, index) => total + Number(digit) * (length + 1 - index),
+      0,
+    );
+    const remainder = (sum * 10) % 11;
+    return remainder === 10 ? 0 : remainder;
+  };
+  return calculateDigit(9) === Number(digits[9]) && calculateDigit(10) === Number(digits[10]);
+}
+
+function safeDeadline(periodStart) {
+  const cap = addMonths(periodStart, 21);
+  const legalLimit = addMonths(periodStart, 22);
   const thirtyDaysBeforeLegal = addDays(legalLimit, -30);
   return [cap, thirtyDaysBeforeLegal].sort()[0];
 }
@@ -137,6 +152,7 @@ function parseImport(text) {
     if (!aliases[key].some((alias) => indexes.has(alias))) throw new Error(`Cabeçalho obrigatório ausente: ${key}.`);
   }
   const seen = new Set();
+  const cpfByRegistration = new Map();
   const parsed = [];
   const errors = [];
 
@@ -144,6 +160,8 @@ function parseImport(text) {
     const row = rows[index];
     const line = index + 1;
     const registration = clean(cell(row, indexes, 'registration'));
+    const rawCpf = cell(row, indexes, 'cpf');
+    const cpf = rawCpf ? rawCpf.replace(/\D/g, '') : '';
     const name = clean(cell(row, indexes, 'name'));
     const role = clean(cell(row, indexes, 'role'));
     const group = clean(cell(row, indexes, 'group')) || clean(cell(row, indexes, 'shiftType'));
@@ -155,6 +173,11 @@ function parseImport(text) {
     const rowErrors = [];
     const rowWarnings = [];
     if (!registration) rowErrors.push('matrícula ausente; conciliação por nome não é permitida');
+    if (rawCpf && !isValidCpf(cpf)) rowErrors.push('CPF inválido; informe um CPF válido com 11 dígitos');
+    if (cpf && cpfByRegistration.has(registration) && cpfByRegistration.get(registration) !== cpf) {
+      rowErrors.push('CPFs divergem entre períodos da mesma matrícula');
+    }
+    if (cpf) cpfByRegistration.set(registration, cpf);
     if (!name || !role || !group || !status) rowErrors.push('nome, função, plantão/turno e status são obrigatórios');
     if (!periodStart || !periodEnd) rowErrors.push('datas válidas de início/fim aquisitivos são obrigatórias');
     if (periodStart && periodEnd && periodStart > periodEnd) rowErrors.push('período aquisitivo invertido');
@@ -192,7 +215,7 @@ function parseImport(text) {
     const vacation2026 = optionalDate('vacation2026', 'ferias_2026');
     const vacation2027 = optionalDate('vacation2027', 'ferias_2027');
     const suppliedDeadline = optionalDate('importedDeadline', 'dt_limite_maxima');
-    let deadline = periodEnd ? safeDeadline(periodEnd) : null;
+    let deadline = periodStart ? safeDeadline(periodStart) : null;
     if (suppliedDeadline && periodEnd && suppliedDeadline <= periodEnd) rowErrors.push('dt_limite_maxima deve ser posterior ao fim aquisitivo');
     if (suppliedDeadline && deadline && suppliedDeadline < deadline) {
       rowWarnings.push(`dt_limite_maxima recebido ${suppliedDeadline} é mais restritivo; será respeitado`);
@@ -211,6 +234,7 @@ function parseImport(text) {
       parsed.push({
         line,
         registration,
+        cpf,
         name,
         role,
         sector: clean(cell(row, indexes, 'sector')),
@@ -245,6 +269,15 @@ function scaleFor(group, scales) {
 
 function programKey(employeeId, start, end) {
   return `${employeeId}|${start}|${end}`;
+}
+
+function vacationStatus(start, end) {
+  if (!start || !end) return 'Pendente';
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  if (end < today) return 'Concluída';
+  if (start <= today) return 'Em Gozo';
+  return 'Agendada';
 }
 
 async function main() {
@@ -316,8 +349,22 @@ async function main() {
   if ((savedEmployees || []).length !== employeeWrites.size) throw new Error('Upsert não retornou todas as matrículas; programas não foram gravados.');
   const idsByRegistration = new Map(savedEmployees.map((employee) => [employee.registration, employee.id]));
   const employeeIds = [...idsByRegistration.values()];
+  const esocialWrites = [...new Map(source
+    .filter((item) => item.cpf)
+    .map((item) => [item.registration, item.cpf])).entries()]
+    .map(([registration, cpf]) => {
+      const employeeId = idsByRegistration.get(registration);
+      if (!employeeId) throw new Error(`Matrícula ${registration} não retornou id_colaborador para o CPF.`);
+      return { employee_id: employeeId, cpf, updated_at: new Date().toISOString() };
+    });
+  if (esocialWrites.length > 0) {
+    const { error: writeEsocialError } = await client
+      .from('employee_esocial_data')
+      .upsert(esocialWrites, { onConflict: 'employee_id' });
+    if (writeEsocialError) throw new Error(`Colaboradores foram salvos, mas falhou a gravação protegida do CPF: ${writeEsocialError.message}`);
+  }
   const { data: previousPrograms, error: readProgramsError } = await client
-    .from('vacation_programs').select('*').in('employee_id', employeeIds);
+    .from('vacation_schedules').select('*').in('employee_id', employeeIds);
   if (readProgramsError) throw new Error(`Colaboradores foram salvos, mas falhou a leitura de programações anteriores: ${readProgramsError.message}`);
   const previousByKey = new Map((previousPrograms || []).map((program) => [
     programKey(program.employee_id, program.periodo_aquisitivo_inicio, program.periodo_aquisitivo_fim),
@@ -340,11 +387,12 @@ async function main() {
       data_fim_programada: manual ? previous.data_fim_programada : end || previous?.data_fim_programada || null,
       ajuste_manual_flag: manual || Boolean(start),
       observacao_dp: previous?.observacao_dp || '',
-      status: previous?.status || 'PENDENTE',
+      status: vacationStatus(manual ? previous.data_inicio_programada : start || previous?.data_inicio_programada || null,
+        manual ? previous.data_fim_programada : end || previous?.data_fim_programada || null),
     };
   });
   const { error: writeProgramsError } = await client
-    .from('vacation_programs')
+    .from('vacation_schedules')
     .upsert(programs, { onConflict: 'employee_id,periodo_aquisitivo_inicio,periodo_aquisitivo_fim' });
   if (writeProgramsError) throw new Error(`Colaboradores foram salvos, mas falhou o upsert dos períodos: ${writeProgramsError.message}`);
   console.log(`Importação concluída: ${employeeWrites.size} matrícula(s), ${programs.length} período(s); nenhum dado existente foi excluído.`);
