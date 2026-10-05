@@ -65,10 +65,16 @@ export default function App() {
         </div>
 
         {error && (
-          <div role="alert" className="mb-5 flex items-start gap-3 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-200">
-            <AlertTriangle size={17} className="mt-0.5 shrink-0" />
-            <span>{error}</span>
-            <button type="button" onClick={() => { void loadData(); }} className="ml-auto shrink-0 underline">Tentar novamente</button>
+          <div role="alert" className="mb-5 rounded-lg border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-200">
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={17} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+              <button type="button" onClick={() => { void loadData(); }} className="ml-auto shrink-0 underline">Tentar novamente</button>
+            </div>
+            <section className="mt-3 rounded-md border border-rose-400/20 bg-slate-950/40 p-3" aria-label="Diagnóstico da conexão Supabase">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-rose-100">Diagnóstico Supabase</h2>
+              <pre className="mt-2 whitespace-pre-wrap break-words font-mono text-xs text-rose-200">{error}</pre>
+            </section>
           </div>
         )}
 

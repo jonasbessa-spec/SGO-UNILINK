@@ -61,7 +61,7 @@ export async function getEmployees(): Promise<Employee[]> {
       message: error.message,
       code: error.code,
     });
-    throw new Error(`Falha ao buscar colaboradores no Supabase: ${error.message}`);
+    throw new Error(`Erro Supabase [${error.code || 'sem código'}]: ${error.message}`);
   }
 
   return ((data || []) as Record<string, unknown>[]).map(mapEmployee);
@@ -78,7 +78,7 @@ export async function getVacations(): Promise<VacationSchedule[]> {
       message: error.message,
       code: error.code,
     });
-    throw new Error(`Falha ao buscar programações de férias no Supabase: ${error.message}`);
+    throw new Error(`Erro Supabase [${error.code || 'sem código'}]: ${error.message}`);
   }
 
   return (data || []) as VacationSchedule[];
