@@ -4,7 +4,8 @@ import type { VacationSchedule } from '@/types/vocation';
 
 function firstValue(row: Record<string, unknown>, ...keys: string[]): unknown {
   for (const key of keys) {
-    if (row[key] !== undefined && row[key] !== null) return row[key];
+    const value = row[key];
+    if (value !== undefined && value !== null && value !== '') return value;
   }
   return undefined;
 }
@@ -20,18 +21,21 @@ function nullableTextValue(row: Record<string, unknown>, ...keys: string[]): str
 }
 
 function mapEmployee(row: Record<string, unknown>): Employee {
+  const createdAt = textValue(row, 'created_at', 'criado_em');
+
   return {
-    id: textValue(row, 'id', 'id_colaborador', 'colaborador_id'),
-    name: textValue(row, 'name', 'nome'),
+    id: textValue(row, 'id'),
+    name: textValue(row, 'nome', 'name'),
+    cpf: nullableTextValue(row, 'cpf'),
     registration: textValue(row, 'registration', 'matricula', 'matrícula'),
-    role: textValue(row, 'role', 'cargo', 'funcao', 'função'),
+    role: textValue(row, 'cargo', 'role', 'funcao', 'função'),
     sector: textValue(row, 'sector', 'setor'),
-    shift_group: textValue(row, 'shift_group', 'turno', 'plantao', 'plantão'),
+    shift_group: textValue(row, 'turno', 'shift', 'shift_group', 'plantao', 'plantão'),
     shift_type: textValue(row, 'shift_type', 'tipo_turno') || undefined,
     schedule_start: textValue(row, 'schedule_start', 'horario_inicio', 'hora_inicio'),
     schedule_end: textValue(row, 'schedule_end', 'horario_fim', 'hora_fim'),
     status: textValue(row, 'status', 'situacao', 'situação') || 'Ativo',
-    hire_date: nullableTextValue(row, 'hire_date', 'admissao', 'admissão'),
+    hire_date: nullableTextValue(row, 'data_admissao', 'hire_date', 'admissao', 'admissão') || createdAt || null,
     scale_status: textValue(row, 'scale_status', 'status_escala') || 'Em escala',
     notes: textValue(row, 'notes', 'observacoes', 'observações'),
     coordinator: textValue(row, 'coordinator', 'coordenador') || undefined,
@@ -41,17 +45,15 @@ function mapEmployee(row: Record<string, unknown>): Employee {
     vacation_2027: nullableTextValue(row, 'vacation_2027', 'ferias_2027', 'férias_2027'),
     absence_reason: textValue(row, 'absence_reason', 'motivo_ausencia') || undefined,
     is_absent: firstValue(row, 'is_absent', 'ausente') === true,
-    inicio_periodo_aquisitivo: nullableTextValue(row, 'inicio_periodo_aquisitivo'),
-    fim_periodo_concessivo: nullableTextValue(row, 'fim_periodo_concessivo'),
-    created_at: textValue(row, 'created_at', 'criado_em'),
+    inicio_periodo_aquisitivo: nullableTextValue(row, 'inicio_periodo_aquisitivo', 'period_start'),
+    fim_periodo_concessivo: nullableTextValue(row, 'fim_periodo_concessivo', 'period_end'),
+    created_at: createdAt,
     updated_at: textValue(row, 'updated_at', 'atualizado_em'),
   };
 }
 
 export async function getEmployees(): Promise<Employee[]> {
-  const { data, error } = await supabase
-    .from('colaboradores')
-    .select('*');
+  const { data, error } = await supabase.from('colaboradores').select('*');
 
   if (error) {
     console.error('Supabase colaboradores query failed:', {

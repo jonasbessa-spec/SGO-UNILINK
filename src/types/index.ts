@@ -17,6 +17,7 @@ export interface ShiftScale {
 export interface Employee {
   id: string;
   name: string;
+  cpf?: string | null;
   registration: string;
   role: string;
   sector: string;
