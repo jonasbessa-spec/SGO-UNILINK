@@ -3,7 +3,7 @@ import { AlertTriangle, CalendarDays, CalendarClock, Check, CheckCircle2, Downlo
 import { supabase } from '@/lib/supabase';
 import { EmptyState, PageHeader } from '@/components/ui/Layout';
 import { Input, Select, Textarea } from '@/components/ui/Form';
-import type { Employee, ShiftScale } from '@/types';
+import type { Employee } from '@/types';
 import {
   addCalendarDays,
   calculateCoverageGaps,
@@ -21,11 +21,11 @@ import {
   type VacationMinimum,
   type VacationProgram,
 } from '@/lib/vacationPlanning';
-import type { VacationScheduleHistory } from '@/types/vocation';
+import type { VacationSchedule, VacationScheduleHistory } from '@/types/vocation';
 
 interface VacationProgrammingTabProps {
   employees: Employee[];
-  shiftScales: ShiftScale[];
+  vacations: VacationSchedule[];
   onDataChanged: () => Promise<void>;
 }
 
@@ -79,19 +79,23 @@ function statusForScale(status: string): string {
   return 'Em escala';
 }
 
-function findSchedule(group: string, scales: ShiftScale[]): ShiftScale | null {
-  const matches = scales.filter((scale) => scale.is_active && scale.shift_group.trim().toUpperCase() === group.trim().toUpperCase());
+function findSchedule(group: string, employees: Employee[]): { start_time: string; end_time: string } | null {
+  const matches = employees.filter((employee) =>
+    employee.shift_group.trim().toUpperCase() === group.trim().toUpperCase() &&
+    employee.schedule_start &&
+    employee.schedule_end);
   if (matches.length === 0) return null;
   const first = matches[0];
-  return matches.every((scale) => scale.start_time === first.start_time && scale.end_time === first.end_time)
-    ? first
+  return matches.every((employee) =>
+    employee.schedule_start === first.schedule_start && employee.schedule_end === first.schedule_end)
+    ? { start_time: first.schedule_start, end_time: first.schedule_end }
     : null;
 }
 
 const DP_EMAIL = 'jonas.bessa@unilinktransportes.com.br';
 type UrgencyFilter = 'all' | 'critical' | 'attention' | 'conflict' | 'scheduled' | 'regular' | 'projected';
 
-export function VacationTab({ employees, shiftScales, onDataChanged }: VacationProgrammingTabProps) {
+export function VacationTab({ employees, vacations, onDataChanged }: VacationProgrammingTabProps) {
   const today = useMemo(localToday, []);
   const [selectedCoverageDate, setSelectedCoverageDate] = useState(localToday);
   const [selectedMonth, setSelectedMonth] = useState(localToday().slice(0, 7));
@@ -120,6 +124,10 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
   const [searchText, setSearchText] = useState('');
   const [showSaveConfirmation, setShowSaveConfirmation] = useState(false);
   const isDp = authEmail?.toLowerCase() === DP_EMAIL;
+
+  useEffect(() => {
+    setPrograms(vacations);
+  }, [vacations]);
 
   useEffect(() => {
     let isMounted = true;
@@ -178,13 +186,12 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
     setDataAvailable(false);
     setError('');
     try {
-      const [programResult, minimumResult, assignmentResult, leaveResult] = await Promise.all([
-        supabase.from('vacation_schedules').select('*').order('dt_limite_maxima'),
+      const [minimumResult, assignmentResult, leaveResult] = await Promise.all([
         supabase.from('vacation_coverage_bases').select('*').order('funcao').order('plantao'),
         supabase.from('shift_assignments').select('employee_id,date,shift_group,role,status').gte('date', today).order('date').limit(10000),
         supabase.from('leave_records').select('employee_id,start_date,end_date,status,leave_type').order('start_date').limit(10000),
       ]);
-      const failed = [programResult, minimumResult, assignmentResult, leaveResult].find((result) => result.error);
+      const failed = [minimumResult, assignmentResult, leaveResult].find((result) => result.error);
       if (failed?.error) {
         setError(`Falha ao carregar dados da programação: ${failed.error.message}. Confirme a migration e as permissões do Supabase.`);
         return;
@@ -193,7 +200,6 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         setError('A consulta atingiu o limite de segurança de 10.000 registros. A programação foi bloqueada para não validar uma cobertura incompleta.');
         return;
       }
-      setPrograms((programResult.data || []) as VacationProgram[]);
       setMinimums((minimumResult.data || []) as VacationMinimum[]);
       setAssignments((assignmentResult.data || []) as VacationAssignment[]);
       setLeaves((leaveResult.data || []) as VacationLeave[]);
@@ -427,7 +433,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         }
         const existing = employeesByRegistration.get(source.registration);
         const previousWrite = employeeWrites.get(source.registration);
-        const configuredScale = findSchedule(source.shiftGroup, shiftScales);
+        const configuredScale = findSchedule(source.shiftGroup, employees);
         const scheduleStart = source.scheduleStart || existing?.schedule_start || previousWrite?.schedule_start || configuredScale?.start_time;
         const scheduleEnd = source.scheduleEnd || existing?.schedule_end || previousWrite?.schedule_end || configuredScale?.end_time;
         const sector = source.sector || existing?.sector || previousWrite?.sector;
@@ -655,7 +661,7 @@ export function VacationTab({ employees, shiftScales, onDataChanged }: VacationP
         return;
       }
       setSuccess('Plano salvo. Itens sem dados de duração ou cobertura permanecem pendentes, sem datas inventadas.');
-      await loadData();
+      await Promise.all([loadData(), onDataChanged()]);
     } catch (reason) {
       setError(`Falha de comunicação ao salvar plano: ${errorMessage(reason)}`);
     } finally {

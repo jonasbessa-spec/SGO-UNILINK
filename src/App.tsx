@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CalendarDays, RefreshCw } from 'lucide-react';
 import { VacationTab } from '@/components/VacationTab';
-import { supabase } from '@/lib/supabase';
-import type { Employee, ShiftScale } from '@/types';
+import { getEmployees, getVacations } from '@/services/employeesService';
+import type { Employee } from '@/types';
+import type { VacationSchedule } from '@/types/vocation';
 
 function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : 'erro inesperado';
@@ -10,7 +11,7 @@ function errorMessage(reason: unknown): string {
 
 export default function App() {
   const [employees, setEmployees] = useState<Employee[]>([]);
-  const [shiftScales, setShiftScales] = useState<ShiftScale[]>([]);
+  const [vacations, setVacations] = useState<VacationSchedule[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -18,16 +19,14 @@ export default function App() {
     setIsLoading(true);
     setError('');
     try {
-      const [employeeResult, scaleResult] = await Promise.all([
-        supabase.from('employees').select('*').order('name'),
-        supabase.from('shift_scales').select('*').order('shift_group'),
+      const [employeeData, vacationData] = await Promise.all([
+        getEmployees(),
+        getVacations(),
       ]);
-      const loadError = employeeResult.error || scaleResult.error;
-      if (loadError) throw new Error(loadError.message);
-      setEmployees((employeeResult.data || []) as Employee[]);
-      setShiftScales((scaleResult.data || []) as ShiftScale[]);
+      setEmployees(employeeData);
+      setVacations(vacationData);
     } catch (reason) {
-      setError(`Não foi possível carregar colaboradores e plantões: ${errorMessage(reason)}.`);
+      setError(`Não foi possível carregar colaboradores, férias e plantões: ${errorMessage(reason)}.`);
     } finally {
       setIsLoading(false);
     }
@@ -74,9 +73,21 @@ export default function App() {
         )}
 
         {isLoading ? (
-          <div className="rounded-xl border border-slate-700 bg-slate-800 p-12 text-center text-sm text-slate-400">Carregando cadastro de colaboradores e escalas…</div>
+          <div className="rounded-xl border border-slate-700 bg-slate-800 p-12 text-center text-sm text-slate-400">Carregando dados...</div>
         ) : (
-          <VacationTab employees={employees} shiftScales={shiftScales} onDataChanged={loadData} />
+          <>
+            {employees.length === 0 && (
+              <div role="status" className="mb-5 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200">
+                Conexão com o Supabase estabelecida, mas a tabela colaboradores está sem registros cadastrados.
+              </div>
+            )}
+            {vacations.length === 0 && (
+              <div role="status" className="mb-5 rounded-lg border border-slate-700 bg-slate-800 p-3 text-sm text-slate-300">
+                Nenhuma programação de férias cadastrada ainda. Os períodos aparecerão aqui após serem cadastrados.
+              </div>
+            )}
+            <VacationTab employees={employees} vacations={vacations} onDataChanged={loadData} />
+          </>
         )}
       </main>
     </div>

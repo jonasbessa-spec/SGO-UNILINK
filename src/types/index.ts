@@ -33,6 +33,8 @@ export interface Employee {
   manager?: string;
   vacation_2026?: string | null;
   vacation_2027?: string | null;
+  inicio_periodo_aquisitivo?: string | null;
+  fim_periodo_concessivo?: string | null;
   absence_reason?: string;
   is_absent?: boolean;
   created_at: string;
