@@ -1,147 +1,836 @@
-import React, { useState, useEffect } from 'react';
-import { supabase } from '../lib/supabase';
-import { Save } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { AlertTriangle, CalendarDays, CalendarClock, Check, CheckCircle2, FileUp, Filter, LogIn, LogOut, RefreshCw, Save, Search, Settings2, ShieldAlert, Sparkles } from 'lucide-react';
+import { supabase } from '@/lib/supabase';
+import { EmptyState, PageHeader } from '@/components/ui/Layout';
+import { Input, Select, Textarea } from '@/components/ui/Form';
+import type { Employee, ShiftScale } from '@/types';
+import {
+  addCalendarDays,
+  calculateCoverageGaps,
+  calculateVacationDeadline,
+  decodeTabularFile,
+  parseVacationImport,
+  planVacationPrograms,
+  type ParsedVacationRow,
+  type VacationAssignment,
+  type VacationEmployee,
+  type VacationLeave,
+  type VacationMinimum,
+  type VacationProgram,
+} from '@/lib/vacationPlanning';
 
-export function VacationTab({ isAdmin }: { isAdmin: boolean }) {
-  const [schedules, setSchedules] = useState<any[]>([]);
-  const [coverageBases, setCoverageBases] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+interface VacationProgrammingTabProps {
+  employees: Employee[];
+  shiftScales: ShiftScale[];
+  onDataChanged: () => Promise<void>;
+}
 
-  const loadVacationData = async () => {
-    setLoading(true);
-    // Busca programações com os dados dos colaboradores legados
-    const { data: schedData, error: schedErr } = await supabase
-      .from('vacation_schedules')
-      .select('*, colaboradores:employee_id(NOME, FUNCAO, PLANTAO, STATUS)');
+interface EmployeeWrite {
+  id?: string;
+  registration: string;
+  name: string;
+  role: string;
+  sector: string;
+  shift_group: string;
+  shift_type: string;
+  status: string;
+  hire_date: string | null;
+  schedule_start: string;
+  schedule_end: string;
+  scale_status: string;
+  notes: string;
+  vacation_2026: string | null;
+  vacation_2027: string | null;
+}
 
-    // Busca bases de mínimos operacionais
-    const { data: baseData, error: baseErr } = await supabase
-      .from('vacation_coverage_bases')
-      .select('*');
+function localToday(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
 
-    if (!schedErr) setSchedules(schedData || []);
-    if (!baseErr) setCoverageBases(baseData || []);
-    setLoading(false);
-  };
+function inclusiveDays(start: string, end: string): number {
+  return Math.round((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86_400_000) + 1;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Ocorreu um erro inesperado.';
+}
+
+function employeeStatus(value: string): string {
+  const normalized = value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase();
+  if (normalized === 'AFASTADO') return 'Afastado';
+  if (normalized === 'FERIAS') return 'Férias';
+  if (normalized === 'INATIVO') return 'Inativo';
+  return 'Ativo';
+}
+
+function statusForScale(status: string): string {
+  if (status === 'Afastado') return 'Afastado';
+  if (status === 'Férias') return 'Em férias';
+  if (status === 'Inativo') return 'Inativo';
+  return 'Em escala';
+}
+
+function findSchedule(group: string, scales: ShiftScale[]): ShiftScale | null {
+  const matches = scales.filter((scale) => scale.is_active && scale.shift_group.trim().toUpperCase() === group.trim().toUpperCase());
+  if (matches.length === 0) return null;
+  const first = matches[0];
+  return matches.every((scale) => scale.start_time === first.start_time && scale.end_time === first.end_time)
+    ? first
+    : null;
+}
+
+const DP_EMAIL = 'jonas.bessa@unilinktransportes.com.br';
+type UrgencyFilter = 'all' | 'critical' | 'attention' | 'conflict' | 'scheduled' | 'regular' | 'projected';
+
+export function VacationTab({ employees, shiftScales, onDataChanged }: VacationProgrammingTabProps) {
+  const today = useMemo(localToday, []);
+  const [programs, setPrograms] = useState<VacationProgram[]>([]);
+  const [minimums, setMinimums] = useState<VacationMinimum[]>([]);
+  const [assignments, setAssignments] = useState<VacationAssignment[]>([]);
+  const [leaves, setLeaves] = useState<VacationLeave[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [dataAvailable, setDataAvailable] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [preview, setPreview] = useState<ParsedVacationRow[]>([]);
+  const [minimumRole, setMinimumRole] = useState('');
+  const [minimumGroup, setMinimumGroup] = useState('');
+  const [minimumCount, setMinimumCount] = useState('');
+  const [authEmail, setAuthEmail] = useState<string | null>(null);
+  const [dpPassword, setDpPassword] = useState('');
+  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [urgencyFilter, setUrgencyFilter] = useState<UrgencyFilter>('all');
+  const [filterGroup, setFilterGroup] = useState('');
+  const [filterRole, setFilterRole] = useState('');
+  const [searchText, setSearchText] = useState('');
+  const [showSaveConfirmation, setShowSaveConfirmation] = useState(false);
+  const isDp = authEmail?.toLowerCase() === DP_EMAIL;
 
   useEffect(() => {
-    loadVacationData();
+    let isMounted = true;
+    void supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (!isMounted) return;
+      if (sessionError) {
+        setError(`Não foi possível verificar a sessão do DP: ${sessionError.message}`);
+        return;
+      }
+      setAuthEmail(data.session?.user.email?.toLowerCase() || null);
+    }).catch((reason: unknown) => {
+      if (isMounted) setError(`Não foi possível verificar a sessão do DP: ${errorMessage(reason)}`);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuthEmail(session?.user.email?.toLowerCase() || null);
+    });
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
-  const handleUpdateSchedule = async (id: string, newStart: string, newEnd: string, obs: string) => {
-    if (!isAdmin) return alert('Acesso restrito ao perfil Administrador/DP.');
-    const { error } = await supabase
-      .from('vacation_schedules')
-      .update({
-        data_inicio_programada: newStart || null,
-        data_fim_programada: newEnd || null,
-        observacao_dp: obs,
-        ajuste_manual_flag: true,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', id);
+  const signInAsDp = async () => {
+    setIsSigningIn(true);
+    setError('');
+    setSuccess('');
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: DP_EMAIL,
+        password: dpPassword,
+      });
+      if (signInError) {
+        setError(`Não foi possível autenticar o DP: ${signInError.message}`);
+        return;
+      }
+      setDpPassword('');
+      setSuccess('Acesso de DP autorizado.');
+    } catch (reason) {
+      setError(`Falha de comunicação ao autenticar o DP: ${errorMessage(reason)}`);
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
 
-    if (error) {
-      alert('Erro ao atualizar programação: ' + error.message);
-    } else {
-      alert('Programação atualizada com sucesso!');
-      loadVacationData();
+  const signOut = async () => {
+    const { error: signOutError } = await supabase.auth.signOut();
+    if (signOutError) {
+      setError(`Não foi possível encerrar a sessão do DP: ${signOutError.message}`);
+      return;
+    }
+    setSuccess('Sessão do DP encerrada. O módulo está em modo de visualização.');
+  };
+
+  const loadData = useCallback(async () => {
+    setIsLoading(true);
+    setDataAvailable(false);
+    setError('');
+    try {
+      const [programResult, minimumResult, assignmentResult, leaveResult] = await Promise.all([
+        supabase.from('vacation_schedules').select('*').order('dt_limite_maxima'),
+        supabase.from('vacation_coverage_bases').select('*').order('funcao').order('plantao'),
+        supabase.from('shift_assignments').select('employee_id,date,shift_group,role,status').gte('date', today).order('date').limit(10000),
+        supabase.from('leave_records').select('employee_id,start_date,end_date,status').order('start_date').limit(10000),
+      ]);
+      const failed = [programResult, minimumResult, assignmentResult, leaveResult].find((result) => result.error);
+      if (failed?.error) {
+        setError(`Falha ao carregar dados da programação: ${failed.error.message}. Confirme a migration e as permissões do Supabase.`);
+        return;
+      }
+      if ((assignmentResult.data || []).length >= 10000 || (leaveResult.data || []).length >= 10000) {
+        setError('A consulta atingiu o limite de segurança de 10.000 registros. A programação foi bloqueada para não validar uma cobertura incompleta.');
+        return;
+      }
+      setPrograms((programResult.data || []) as VacationProgram[]);
+      setMinimums((minimumResult.data || []) as VacationMinimum[]);
+      setAssignments((assignmentResult.data || []) as VacationAssignment[]);
+      setLeaves((leaveResult.data || []) as VacationLeave[]);
+      setDataAvailable(true);
+    } catch (reason) {
+      setError(`Falha de comunicação ao carregar dados da programação: ${errorMessage(reason)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [today]);
+
+  useEffect(() => { void loadData(); }, [loadData]);
+
+  const planningEmployees = useMemo<VacationEmployee[]>(() => employees.map((employee) => ({
+    id: employee.id,
+    registration: employee.registration,
+    name: employee.name,
+    role: employee.role,
+    shift_group: employee.shift_group,
+    shift_type: employee.shift_type,
+    status: employee.status,
+    vacation_2026: employee.vacation_2026,
+    vacation_2027: employee.vacation_2027,
+  })), [employees]);
+
+  const planned = useMemo(() => planVacationPrograms({
+    programs,
+    employees: planningEmployees,
+    minimums,
+    assignments,
+    leaves,
+    today,
+  }), [programs, planningEmployees, minimums, assignments, leaves, today]);
+
+  const coverageGaps = useMemo(() => calculateCoverageGaps({
+    employees: planningEmployees,
+    minimums,
+    assignments,
+    leaves,
+    programs,
+    today,
+  }), [planningEmployees, minimums, assignments, leaves, programs, today]);
+
+  const roleOptions = useMemo(() => [...new Set(employees.map((employee) => employee.role).filter(Boolean))].sort(), [employees]);
+  const groupOptions = useMemo(() => [...new Set(employees.map((employee) => employee.shift_group || employee.shift_type || '').filter(Boolean))].sort(), [employees]);
+  const validImportRows = preview.filter((row) => row.program);
+  const invalidImportCount = preview.length - validImportRows.length;
+  const criticalCount = programs.filter((program) => {
+    const days = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+    return days <= 30;
+  }).length;
+  const attentionCount = programs.filter((program) => {
+    const days = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+    return days > 30 && days <= 60;
+  }).length;
+  const validatedCount = planned.filter((item) =>
+    item.status === 'PROGRAMADO' &&
+    item.program.data_inicio_programada !== null &&
+    item.program.data_fim_programada !== null).length;
+  const conflictCount = planned.filter((item) =>
+    item.status === 'CONFLITO' || item.status === 'BLOQUEADO').length;
+  const manualCount = programs.filter((program) => program.ajuste_manual_flag).length;
+  const automaticCount = programs.filter((program) =>
+    !program.ajuste_manual_flag &&
+    program.data_inicio_programada !== null &&
+    program.data_fim_programada !== null).length;
+  const filteredPlanned = planned.filter((item) => {
+    const program = item.program;
+    const employee = employees.find((candidate) => candidate.id === program.employee_id);
+    const days = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+    const isProjected = !program.ajuste_manual_flag && Boolean(program.data_inicio_programada && program.data_fim_programada);
+    const urgencyMatches = urgencyFilter === 'all' ||
+      (urgencyFilter === 'critical' && days <= 30) ||
+      (urgencyFilter === 'attention' && days > 30 && days <= 60) ||
+      (urgencyFilter === 'conflict' && (item.status === 'CONFLITO' || item.status === 'BLOQUEADO')) ||
+      (urgencyFilter === 'scheduled' && item.status === 'PROGRAMADO' && Boolean(program.data_inicio_programada && program.data_fim_programada)) ||
+      (urgencyFilter === 'regular' && days > 30 && !isProjected) ||
+      (urgencyFilter === 'projected' && isProjected);
+    const group = employee?.shift_group || employee?.shift_type || '';
+    const search = searchText.trim().toLocaleLowerCase('pt-BR');
+    const textMatches = !search ||
+      employee?.name.toLocaleLowerCase('pt-BR').includes(search) ||
+      employee?.registration.toLocaleLowerCase('pt-BR').includes(search);
+    return urgencyMatches &&
+      (!filterGroup || group === filterGroup) &&
+      (!filterRole || employee?.role === filterRole) &&
+      textMatches;
+  });
+
+  const handleFile = async (file?: File) => {
+    setError('');
+    setSuccess('');
+    setPreview([]);
+    if (!file) return;
+    try {
+      const text = decodeTabularFile(await file.arrayBuffer());
+      setPreview(parseVacationImport(text));
+    } catch (reason) {
+      setError(`Não foi possível ler a planilha: ${errorMessage(reason)}`);
+    }
+  };
+
+  const importRows = async () => {
+    if (!isDp) {
+      setError('Somente o DP autorizado pode importar dados de férias.');
+      return;
+    }
+    const rows = validImportRows.filter((row) => row.program);
+    if (rows.length === 0) return;
+    setIsImporting(true);
+    setError('');
+    setSuccess('');
+    try {
+      const registrations = [...new Set(rows.map((row) => row.program!.employee.registration))];
+      const { data: existingEmployees, error: employeeReadError } = await supabase
+        .from('employees')
+        .select('*')
+        .in('registration', registrations);
+      if (employeeReadError) throw new Error(`Falha ao consultar matrículas existentes: ${employeeReadError.message}`);
+      const employeesByRegistration = new Map((existingEmployees || []).map((employee) => [employee.registration, employee as Employee]));
+      const employeeWrites = new Map<string, EmployeeWrite>();
+      const importErrors: string[] = [];
+
+      for (const row of rows) {
+        const source = row.program!.employee;
+        const existing = employeesByRegistration.get(source.registration);
+        const previousWrite = employeeWrites.get(source.registration);
+        const configuredScale = findSchedule(source.shiftGroup, shiftScales);
+        const scheduleStart = source.scheduleStart || existing?.schedule_start || previousWrite?.schedule_start || configuredScale?.start_time;
+        const scheduleEnd = source.scheduleEnd || existing?.schedule_end || previousWrite?.schedule_end || configuredScale?.end_time;
+        const sector = source.sector || existing?.sector || previousWrite?.sector;
+        if (!scheduleStart || !scheduleEnd) {
+          importErrors.push(`Linha ${row.line} (${source.registration}): não há horário informado nem escala ativa única configurada para ${source.shiftGroup}.`);
+          continue;
+        }
+        if (!sector) {
+          importErrors.push(`Linha ${row.line} (${source.registration}): setor/área é obrigatório para cadastrar uma matrícula nova.`);
+          continue;
+        }
+        if (previousWrite && (
+          previousWrite.name !== source.name ||
+          previousWrite.role !== source.role ||
+          previousWrite.sector !== sector ||
+          previousWrite.shift_group !== source.shiftGroup ||
+          previousWrite.status !== employeeStatus(source.status)
+        )) {
+          importErrors.push(`Linha ${row.line} (${source.registration}): dados cadastrais divergem entre períodos da mesma matrícula.`);
+          continue;
+        }
+        const status = employeeStatus(source.status);
+        employeeWrites.set(source.registration, {
+          ...(existing || {}),
+          ...(existing ? { id: existing.id } : {}),
+          registration: source.registration,
+          name: source.name,
+          role: source.role,
+          sector,
+          shift_group: source.shiftGroup,
+          shift_type: source.shiftType || existing?.shift_type || '',
+          status,
+          hire_date: source.hireDate ?? existing?.hire_date ?? null,
+          schedule_start: scheduleStart,
+          schedule_end: scheduleEnd,
+          scale_status: statusForScale(status),
+          notes: existing?.notes || '',
+          vacation_2026: source.vacation2026 ?? existing?.vacation_2026 ?? null,
+          vacation_2027: source.vacation2027 ?? existing?.vacation_2027 ?? null,
+        });
+      }
+      if (importErrors.length > 0) throw new Error(importErrors.join(' '));
+      const employeePayloads = [...employeeWrites.values()];
+      const { data: savedEmployees, error: employeeWriteError } = await supabase
+        .from('employees')
+        .upsert(employeePayloads, { onConflict: 'registration' })
+        .select('id,registration');
+      if (employeeWriteError) throw new Error(`Falha ao salvar colaboradores por matrícula: ${employeeWriteError.message}`);
+      const employeeIds = (savedEmployees || []).map((employee) => employee.id);
+      if (employeeIds.length !== employeePayloads.length) {
+        throw new Error('O Supabase não retornou todas as matrículas após o upsert; os períodos de férias não foram gravados.');
+      }
+      const idsByRegistration = new Map((savedEmployees || []).map((employee) => [employee.registration, employee.id]));
+      const { data: oldPrograms, error: oldProgramReadError } = await supabase
+        .from('vacation_schedules')
+        .select('*')
+        .in('employee_id', employeeIds);
+      if (oldProgramReadError) {
+        throw new Error(`Colaboradores foram salvos, mas não foi possível consultar programações anteriores: ${oldProgramReadError.message}`);
+      }
+      const programKey = (employeeId: string, start: string, end: string) => `${employeeId}|${start}|${end}`;
+      const oldProgramsByKey = new Map((oldPrograms || []).map((program) => [
+        programKey(program.employee_id, program.periodo_aquisitivo_inicio, program.periodo_aquisitivo_fim),
+        program as VacationProgram,
+      ]));
+      const programWrites = rows.map((row) => {
+        const source = row.program!;
+        const employeeId = idsByRegistration.get(source.employee.registration);
+        if (!employeeId) throw new Error(`Matrícula ${source.employee.registration} não retornou id_colaborador.`);
+        const old = oldProgramsByKey.get(programKey(employeeId, source.acquisitionStart, source.acquisitionEnd));
+        const importedStart = source.scheduledStart || null;
+        const importedEnd = source.scheduledEnd ||
+          (importedStart && source.daysOff ? addCalendarDays(importedStart, source.daysOff - 1) : null);
+        const keepManual = Boolean(old?.ajuste_manual_flag);
+        return {
+          employee_id: employeeId,
+          periodo_aquisitivo_inicio: source.acquisitionStart,
+          periodo_aquisitivo_fim: source.acquisitionEnd,
+          dt_limite_maxima: source.safeDeadline,
+          dias_gozo: keepManual && source.daysOff === undefined ? old?.dias_gozo ?? 30 : source.daysOff ?? old?.dias_gozo ?? 30,
+          data_inicio_programada: keepManual ? old?.data_inicio_programada ?? null : importedStart ?? old?.data_inicio_programada ?? null,
+          data_fim_programada: keepManual ? old?.data_fim_programada ?? null : importedEnd ?? old?.data_fim_programada ?? null,
+          ajuste_manual_flag: keepManual || Boolean(importedStart),
+          observacao_dp: old?.observacao_dp || '',
+        };
+      });
+      const { error: programWriteError } = await supabase
+        .from('vacation_schedules')
+        .upsert(programWrites, { onConflict: 'employee_id,periodo_aquisitivo_inicio,periodo_aquisitivo_fim' });
+      if (programWriteError) {
+        throw new Error(`Colaboradores foram salvos, mas falhou a persistência dos períodos aquisitivos: ${programWriteError.message}`);
+      }
+      setSuccess(`${rows.length} matrícula(s) e período(s) processados por upsert. Linhas inválidas ignoradas: ${invalidImportCount}.`);
+      setPreview([]);
+      await onDataChanged();
+    } catch (reason) {
+      setError(`Importação interrompida: ${errorMessage(reason)}`);
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const saveMinimum = async () => {
+    if (!isDp) {
+      setError('Somente o DP autorizado pode alterar mínimos operacionais.');
+      return;
+    }
+    const count = Number(minimumCount);
+    if (!minimumRole || !minimumGroup || !Number.isInteger(count) || count < 0) {
+      setError('Informe função, turno/plantão e um mínimo inteiro igual ou maior que zero.');
+      return;
+    }
+    const role = minimumRole.trim().replace(/\s+/g, ' ').toUpperCase();
+    const shiftGroup = minimumGroup.trim().replace(/\s+/g, ' ').toUpperCase();
+    setError('');
+    setSuccess('');
+    try {
+      const { error: saveError } = await supabase
+        .from('vacation_coverage_bases')
+        .upsert({ funcao: role, plantao: shiftGroup, minimo_operacional: count }, { onConflict: 'funcao,plantao' });
+      if (saveError) {
+        setError(`Não foi possível salvar o mínimo de cobertura: ${saveError.message}`);
+        return;
+      }
+      setMinimumCount('');
+      setSuccess(`Mínimo salvo: ${role} × ${shiftGroup} = ${count}.`);
+      await loadData();
+    } catch (reason) {
+      setError(`Falha de comunicação ao salvar mínimo: ${errorMessage(reason)}`);
+    }
+  };
+
+  const updateProgram = (id: string, patch: Partial<VacationProgram>) => {
+    if (!isDp) return;
+    setPrograms((current) => current.map((program) => program.id === id ? { ...program, ...patch } : program));
+    setSuccess('');
+  };
+
+  const suggestPlan = () => {
+    if (!isDp) {
+      setError('Somente o DP autorizado pode sugerir ou recalcular a programação.');
+      return;
+    }
+    if (!dataAvailable) {
+      setError('Não é possível sugerir enquanto os dados operacionais não estiverem carregados integralmente.');
+      return;
+    }
+    const balancedSuggestions = planVacationPrograms({
+      programs: programs.map((program) => program.ajuste_manual_flag
+        ? program
+        : { ...program, data_inicio_programada: null, data_fim_programada: null }),
+      employees: planningEmployees,
+      minimums,
+      assignments,
+      leaves,
+      today,
+      allocationStrategy: 'balanced',
+    });
+    setPrograms((current) => current.map((program) => {
+      if (program.ajuste_manual_flag) return program;
+      const result = balancedSuggestions.find((item) => item.program.id === program.id);
+      return result?.status === 'PROGRAMADO'
+        ? { ...program, data_inicio_programada: result.start, data_fim_programada: result.end }
+        : { ...program, data_inicio_programada: null, data_fim_programada: null };
+    }));
+    setSuccess('Sugestões equilibradas por mês calculadas em memória. Confira cobertura e datas antes de confirmar.');
+    setError('');
+  };
+
+  const savePlan = () => {
+    if (!isDp) {
+      setError('Somente o DP autorizado pode salvar a programação.');
+      return;
+    }
+    if (!dataAvailable) {
+      setError('Não é possível salvar enquanto os dados operacionais não estiverem carregados integralmente.');
+      return;
+    }
+    if (planned.some((item) => item.status === 'CONFLITO')) {
+      setError('Existem férias que violam a cobertura mínima. Corrija as datas ou os mínimos antes de salvar.');
+      return;
+    }
+    if (programs.length === 0) return;
+    setShowSaveConfirmation(true);
+  };
+
+  const persistPlan = async () => {
+    setIsSaving(true);
+    setError('');
+    setSuccess('');
+    setShowSaveConfirmation(false);
+    try {
+      const payload = planned.map((item) => ({
+        ...item.program,
+        dias_gozo: item.start && item.end ? inclusiveDays(item.start, item.end) : item.program.dias_gozo,
+        data_inicio_programada: item.start,
+        data_fim_programada: item.end,
+        updated_at: new Date().toISOString(),
+      }));
+      const { error: saveError } = await supabase
+        .from('vacation_schedules')
+        .upsert(payload, { onConflict: 'employee_id,periodo_aquisitivo_inicio,periodo_aquisitivo_fim' });
+      if (saveError) {
+        setError(`Não foi possível salvar o plano: ${saveError.message}`);
+        return;
+      }
+      setSuccess('Plano salvo. Itens sem dados de duração ou cobertura permanecem pendentes, sem datas inventadas.');
+      await loadData();
+    } catch (reason) {
+      setError(`Falha de comunicação ao salvar plano: ${errorMessage(reason)}`);
+    } finally {
+      setIsSaving(false);
     }
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h2 style={{ fontSize: '20px', fontWeight: '800', margin: 0 }}>Programação e Cobertura de Férias</h2>
-          <p style={{ fontSize: '12px', color: '#94a3b8', margin: '4px 0 0 0' }}>
-            Controle de datas limite (21 meses) e garantia de cobertura por turno.
-          </p>
-        </div>
-      </header>
+    <div className="space-y-5">
+      <PageHeader
+        title="Programação de férias"
+        description="Planeje períodos por matrícula, prazo seguro e cobertura diária por função e turno/plantão."
+        actions={
+          <button onClick={() => { void loadData(); }} disabled={isLoading} className="inline-flex items-center gap-2 rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 hover:bg-slate-700 disabled:opacity-50">
+            <RefreshCw size={15} className={isLoading ? 'animate-spin' : ''} /> Atualizar
+          </button>
+        }
+      />
 
-      {/* Tabela de Programação de Férias */}
-      <div style={{ backgroundColor: '#0f172a', borderRadius: '12px', border: '1px solid #1e293b', overflowX: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13px' }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid #1e293b', color: '#64748b', fontSize: '11px', fontWeight: '800' }}>
-              <th style={{ padding: '14px 18px' }}>COLABORADOR</th>
-              <th style={{ padding: '14px 18px' }}>FUNÇÃO / PLANTÃO</th>
-              <th style={{ padding: '14px 18px' }}>PERÍODO AQUISITIVO</th>
-              <th style={{ padding: '14px 18px' }}>DT. LIMITE MÁXIMA</th>
-              <th style={{ padding: '14px 18px' }}>INÍCIO PROGRAMADO</th>
-              <th style={{ padding: '14px 18px' }}>FIM PROGRAMADO</th>
-              <th style={{ padding: '14px 18px' }}>STATUS / AJUSTE</th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading ? (
-              <tr><td colSpan={7} style={{ padding: '24px', textAlign: 'center', color: '#64748b' }}>Carregando dados de férias...</td></tr>
-            ) : schedules.length === 0 ? (
-              <tr><td colSpan={7} style={{ padding: '24px', textAlign: 'center', color: '#64748b' }}>Nenhuma programação cadastrada.</td></tr>
-            ) : (
-              schedules.map((item) => {
-                const colab = item.colaboradores || {};
-                const isOverdue = item.dt_limite_maxima && new Date().toISOString().split('T')[0] > item.dt_limite_maxima;
-                return (
-                  <tr key={item.id} style={{ borderBottom: '1px solid #1e293b' }}>
-                    <td style={{ padding: '14px 18px', fontWeight: '600' }}>{colab.NOME || 'N/A'}</td>
-                    <td style={{ padding: '14px 18px', color: '#94a3b8' }}>{colab.FUNCAO} ({colab.PLANTAO})</td>
-                    <td style={{ padding: '14px 18px', color: '#94a3b8' }}>
-                      {item.periodo_aquisitivo_inicio} à {item.periodo_aquisitivo_fim}
-                    </td>
-                    <td style={{ padding: '14px 18px', color: isOverdue ? '#ef4444' : '#f59e0b', fontWeight: '700' }}>
-                      {item.dt_limite_maxima} {isOverdue && '⚠️'}
-                    </td>
-                    <td style={{ padding: '14px 18px' }}>
-                      <input 
-                        type="date" 
-                        defaultValue={item.data_inicio_programada || ''} 
-                        disabled={!isAdmin}
-                        id={`start-${item.id}`}
-                        style={{ backgroundColor: '#0b0f19', border: '1px solid #334155', color: '#fff', padding: '6px', borderRadius: '4px', fontSize: '12px' }}
-                      />
-                    </td>
-                    <td style={{ padding: '14px 18px' }}>
-                      <input 
-                        type="date" 
-                        defaultValue={item.data_fim_programada || ''} 
-                        disabled={!isAdmin}
-                        id={`end-${item.id}`}
-                        style={{ backgroundColor: '#0b0f19', border: '1px solid #334155', color: '#fff', padding: '6px', borderRadius: '4px', fontSize: '12px' }}
-                      />
-                    </td>
-                    <td style={{ padding: '14px 18px' }}>
-                      {item.ajuste_manual_flag ? (
-                        <span style={{ fontSize: '10px', backgroundColor: 'rgba(59, 130, 246, 0.2)', color: '#60a5fa', padding: '4px 8px', borderRadius: '4px', fontWeight: '700' }}>
-                          Ajuste Manual DP
-                        </span>
-                      ) : (
-                        <span style={{ fontSize: '10px', backgroundColor: 'rgba(34, 197, 94, 0.1)', color: '#22c55e', padding: '4px 8px', borderRadius: '4px', fontWeight: '700' }}>
-                          Automático
-                        </span>
-                      )}
-                      {isAdmin && (
-                        <button 
-                          onClick={() => {
-                            const startVal = (document.getElementById(`start-${item.id}`) as HTMLInputElement)?.value;
-                            const endVal = (document.getElementById(`end-${item.id}`) as HTMLInputElement)?.value;
-                            handleUpdateSchedule(item.id, startVal, endVal, 'Ajustado via painel');
-                          }}
-                          style={{ marginLeft: '8px', background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer' }}
-                          title="Salvar Alteração"
-                        >
-                          <Save size={16} />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
+      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Indicadores de férias">
+        {[
+          { title: 'Férias vencidas / críticas', value: criticalCount, detail: 'vencidas ou vencem em até 30 dias', icon: AlertTriangle, tone: 'rose', border: 'border-rose-500/25', filter: 'critical' as UrgencyFilter },
+          { title: 'Em risco', value: attentionCount, detail: 'limite entre 31 e 60 dias', icon: CalendarClock, tone: 'amber', border: 'border-amber-500/25', filter: 'attention' as UrgencyFilter },
+          { title: 'Conflitos de mínimo', value: conflictCount, detail: `${coverageGaps.length} dias/turnos abaixo do mínimo`, icon: ShieldAlert, tone: 'orange', border: 'border-orange-500/25', filter: 'conflict' as UrgencyFilter },
+          { title: 'Férias agendadas', value: validatedCount, detail: `${manualCount} manuais · ${automaticCount} automáticas`, icon: CheckCircle2, tone: 'emerald', border: 'border-emerald-500/25', filter: 'scheduled' as UrgencyFilter },
+        ].map(({ title, value, detail, icon: Icon, tone, border, filter }) => (
+          <button key={title} type="button" onClick={() => setUrgencyFilter(urgencyFilter === filter ? 'all' : filter)} aria-pressed={urgencyFilter === filter} className={`rounded-xl border bg-slate-800 p-4 text-left transition hover:bg-slate-700/70 ${tone === 'rose' && value > 0 ? 'border-rose-500/50' : border} ${urgencyFilter === filter ? 'ring-2 ring-amber-400/50' : ''}`}>
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">{title}</p>
+              <Icon size={17} className={tone === 'rose' ? 'text-rose-300' : tone === 'amber' ? 'text-amber-300' : tone === 'orange' ? 'text-orange-300' : 'text-emerald-300'} />
+            </div>
+            <p className={`mt-2 text-3xl font-bold ${tone === 'rose' && value > 0 ? 'animate-pulse text-rose-300' : tone === 'amber' ? 'text-amber-200' : tone === 'orange' ? 'text-orange-200' : 'text-slate-100'}`}>{value}</p>
+            <p className="mt-1 text-[11px] text-slate-500">{detail}</p>
+          </button>
+        ))}
+      </section>
+
+      <section className={`flex flex-wrap items-center justify-between gap-4 rounded-xl border p-4 ${isDp ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-slate-700 bg-slate-800'}`}>
+        <div className="flex items-start gap-3">
+          <div className={`mt-0.5 rounded-lg p-2 ${isDp ? 'bg-emerald-500/10 text-emerald-300' : 'bg-slate-700 text-slate-300'}`}>
+            {isDp ? <Check size={17} /> : <LogIn size={17} />}
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-slate-100">{isDp ? 'Acesso de DP autorizado' : 'Modo de visualização'}</p>
+            <p className="mt-1 text-xs text-slate-400">
+              {isDp
+                ? `Sessão autenticada como ${DP_EMAIL}. Alterações também são protegidas pelo Supabase.`
+                : 'As tabelas e os alertas estão disponíveis para consulta. Autentique-se para importar, programar ou alterar mínimos.'}
+            </p>
+          </div>
+        </div>
+        {isDp ? (
+          <button onClick={() => { void signOut(); }} className="inline-flex items-center gap-2 rounded-lg border border-slate-600 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700">
+            <LogOut size={14} /> Encerrar sessão DP
+          </button>
+        ) : (
+          <form onSubmit={(event) => { event.preventDefault(); void signInAsDp(); }} className="flex flex-wrap items-end gap-2">
+            <Input label="Conta DP" type="email" value={DP_EMAIL} readOnly className="min-w-64" />
+            <Input label="Senha Supabase Auth" type="password" value={dpPassword} onChange={(event) => setDpPassword(event.target.value)} autoComplete="current-password" className="min-w-48" />
+            <button type="submit" disabled={isSigningIn || !dpPassword} className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
+              <LogIn size={15} /> {isSigningIn ? 'Autenticando…' : 'Entrar como DP'}
+            </button>
+            {authEmail && authEmail !== DP_EMAIL && <p className="basis-full text-xs text-amber-300">A sessão atual ({authEmail}) não tem permissão para editar férias.</p>}
+          </form>
+        )}
+      </section>
+
+      <div className="grid gap-3 lg:grid-cols-[1.35fr_1fr]">
+        <section className="rounded-xl border border-slate-700 bg-slate-800 p-5">
+          <div className="flex items-center gap-2 text-amber-300">
+            <FileUp size={18} />
+            <h3 className="font-semibold">Importar arquivo de DP</h3>
+          </div>
+          <p className="mt-2 text-sm leading-relaxed text-slate-400">
+            CSV, TSV ou texto delimitado; aceita UTF-8 e Windows-1252. A matrícula, nome, função e início/fim aquisitivos são obrigatórios. O padrão é 30 dias; cada intervalo registrado deve ter de 14 a 30 dias.
+          </p>
+          <label className="mt-4 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-slate-600 bg-slate-900/50 px-4 py-4 text-sm font-medium text-slate-200 hover:border-amber-500/60 hover:bg-slate-900">
+            <FileUp size={17} /> Selecionar CSV/TSV
+            <input type="file" accept=".csv,.tsv,.txt,.text,text/csv,text/tab-separated-values" className="sr-only" disabled={!isDp} onChange={(event) => { void handleFile(event.target.files?.[0]); event.currentTarget.value = ''; }} />
+          </label>
+          {preview.length > 0 && (
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-700 bg-slate-900/70 p-3">
+              <p className="text-xs text-slate-300">
+                {validImportRows.length} linha(s) válidas · {invalidImportCount} linha(s) ignoradas
+              </p>
+              <button onClick={() => { void importRows(); }} disabled={!isDp || isImporting || validImportRows.length === 0} className="inline-flex items-center gap-2 rounded-lg bg-[#e3a62f] px-3 py-2 text-xs font-bold text-[#0b2538] disabled:opacity-50">
+                <FileUp size={14} /> {isImporting ? 'Importando…' : 'Importar linhas válidas'}
+              </button>
+            </div>
+          )}
+          {preview.length > 0 && (
+            <div className="mt-3 max-h-52 space-y-2 overflow-y-auto pr-1">
+              {preview.map((row) => (
+                <div key={row.line} className={`rounded-lg border p-3 text-xs ${row.errors.length ? 'border-rose-500/30 bg-rose-500/5' : 'border-slate-700 bg-slate-900/40'}`}>
+                  <p className="font-semibold text-slate-200">Linha {row.line} · {row.program?.employee.registration || 'sem matrícula'}</p>
+                  {row.errors.map((item) => <p key={item} className="mt-1 text-rose-300">{item}</p>)}
+                  {row.warnings.map((item) => <p key={item} className="mt-1 text-amber-300">{item}</p>)}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-200">
+            <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+            <span>Os TSVs antigos não têm matrícula nem período aquisitivo e não serão vinculados por nome. Novas matrículas precisam de setor/área e de escala ativa configurada (ou horários presentes no cadastro existente).</span>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-slate-700 bg-slate-800 p-5">
+          <div className="flex items-center gap-2 text-sky-300">
+            <Settings2 size={18} />
+            <h3 className="font-semibold">Mínimos de cobertura</h3>
+          </div>
+          <p className="mt-2 text-sm leading-relaxed text-slate-400">
+            Sem mínimo explícito e escala operacional diária, a automação não aloca férias para aquele grupo. Nenhuma quantidade padrão é presumida.
+          </p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <Select label="Função" value={minimumRole} onChange={(event) => setMinimumRole(event.target.value)} options={roleOptions.map((role) => ({ value: role, label: role }))} placeholder="Selecione" disabled={!isDp} />
+            <Select label="Turno / plantão" value={minimumGroup} onChange={(event) => setMinimumGroup(event.target.value)} options={groupOptions.map((group) => ({ value: group, label: group }))} placeholder="Selecione" disabled={!isDp} />
+            <Input label="Mínimo simultâneo" type="number" min="0" step="1" value={minimumCount} onChange={(event) => setMinimumCount(event.target.value)} placeholder="Ex.: 0" disabled={!isDp} />
+            <div className="flex items-end">
+              <button onClick={() => { void saveMinimum(); }} disabled={!isDp} className="w-full rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2.5 text-sm font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-50">Salvar mínimo</button>
+            </div>
+          </div>
+          {minimums.length === 0 ? (
+            <p className="mt-4 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-200">Nenhum mínimo configurado. A geração automática permanecerá bloqueada.</p>
+          ) : (
+            <div className="mt-4 max-h-40 space-y-1 overflow-y-auto">
+              {minimums.map((minimum) => (
+                <div key={`${minimum.funcao}-${minimum.plantao}`} className="flex items-center justify-between rounded-md bg-slate-900/60 px-3 py-2 text-xs">
+                  <span className="text-slate-300">{minimum.funcao} · {minimum.plantao}</span>
+                  <span className="font-semibold text-slate-100">{minimum.minimo_operacional}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
       </div>
+
+      {(error || success) && (
+        <div className={`flex items-start gap-2 rounded-lg border p-3 text-sm ${error ? 'border-rose-500/30 bg-rose-500/10 text-rose-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'}`}>
+          {error ? <AlertTriangle size={17} className="mt-0.5 shrink-0" /> : <Check size={17} className="mt-0.5 shrink-0" />}
+          <span>{error || success}</span>
+        </div>
+      )}
+
+      {coverageGaps.length > 0 && (
+        <section className="rounded-lg border border-orange-500/30 bg-orange-500/10 p-3 text-sm text-orange-100" role="status">
+          <div className="flex items-start gap-2">
+            <ShieldAlert size={17} className="mt-0.5 shrink-0" />
+            <div>
+              <p className="font-semibold">{coverageGaps.length} gargalo(s) de cobertura encontrado(s)</p>
+              <p className="mt-1 text-xs text-orange-200">
+                {coverageGaps.slice(0, 4).map((gap) => `${gap.date}: ${gap.funcao} · ${gap.plantao} (${gap.disponiveis}/${gap.minimo})`).join(' · ')}
+                {coverageGaps.length > 4 ? ' · …' : ''}
+              </p>
+            </div>
+          </div>
+        </section>
+      )}
+
+      <section className="rounded-xl border border-slate-700 bg-slate-800 p-4">
+        <div className="mb-3 flex items-center gap-2 text-slate-300">
+          <Filter size={16} />
+          <h3 className="text-xs font-semibold uppercase tracking-wide">Filtros operacionais</h3>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <label className="relative">
+            <span className="sr-only">Buscar por nome ou matrícula</span>
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+            <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Nome ou matrícula" className="w-full rounded-lg border border-slate-600 bg-slate-900 py-2 pl-9 pr-3 text-sm text-slate-200 placeholder:text-slate-500" />
+          </label>
+          <Select label="Urgência" value={urgencyFilter} onChange={(event) => setUrgencyFilter(event.target.value as UrgencyFilter)} options={[
+            { value: 'all', label: 'Todas as situações' },
+            { value: 'critical', label: 'Críticos · até 30 dias' },
+            { value: 'attention', label: 'Em risco · 31–60 dias' },
+            { value: 'conflict', label: 'Com conflito/bloqueio' },
+            { value: 'scheduled', label: 'Agendados e validados' },
+            { value: 'regular', label: 'Regular' },
+            { value: 'projected', label: 'Projetado pelo algoritmo' },
+          ]} />
+          <Select label="Plantão / turno" value={filterGroup} onChange={(event) => setFilterGroup(event.target.value)} options={groupOptions.map((group) => ({ value: group, label: group }))} placeholder="Todos os plantões" />
+          <Select label="Função" value={filterRole} onChange={(event) => setFilterRole(event.target.value)} options={roleOptions.map((role) => ({ value: role, label: role }))} placeholder="Todas as funções" />
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-xl border border-slate-700 bg-slate-800">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-700 px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="rounded-lg bg-amber-500/10 p-2 text-amber-300"><CalendarDays size={18} /></div>
+            <div>
+              <h3 className="font-semibold text-slate-100">Plano por período aquisitivo</h3>
+              <p className="mt-1 text-xs text-slate-400">{filteredPlanned.length} de {programs.length} períodos · prioridade pelo limite mais próximo</p>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={suggestPlan} disabled={!isDp || isLoading || !dataAvailable || programs.length === 0} className="inline-flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-sm font-semibold text-violet-200 hover:bg-violet-500/20 disabled:opacity-50">
+              <Sparkles size={15} /> ⚡ Sugerir Escala Automática (IA/Algoritmo)
+            </button>
+            <button onClick={() => { void savePlan(); }} disabled={!isDp || isLoading || !dataAvailable || isSaving || programs.length === 0} className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
+              <Save size={15} /> {isSaving ? 'Salvando…' : 'Salvar plano'}
+            </button>
+          </div>
+        </div>
+        {planned.some((item) => item.status === 'CONFLITO') && (
+          <div className="border-b border-rose-500/20 bg-rose-500/5 px-5 py-3 text-xs text-rose-200">
+            {planned.filter((item) => item.status === 'CONFLITO').length} programação(ões) conflitam com janela aquisitiva ou cobertura. O plano não será salvo enquanto os conflitos persistirem.
+          </div>
+        )}
+        {showSaveConfirmation && (
+          <div className="border-b border-sky-500/30 bg-sky-500/10 px-5 py-4" role="dialog" aria-modal="true" aria-labelledby="vacation-save-confirm-title">
+            <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3">
+              <div>
+                <h4 id="vacation-save-confirm-title" className="text-sm font-semibold text-sky-100">Validar alterações antes de salvar</h4>
+                <p className="mt-1 text-xs text-sky-200">
+                  {planned.filter((item) => item.status === 'PROGRAMADO').length} programação(ões) sem conflito · {planned.filter((item) => item.status === 'PENDENTE' || item.status === 'BLOQUEADO').length} pendente(s)/bloqueada(s).
+                  {' '}As datas editadas foram recalculadas em memória; gargalos identificados não podem ser persistidos.
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => setShowSaveConfirmation(false)} className="rounded-lg border border-slate-600 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700">Revisar</button>
+                <button onClick={() => { void persistPlan(); }} disabled={isSaving} className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-3 py-2 text-xs font-semibold text-white hover:bg-sky-500 disabled:opacity-50">
+                  <Check size={14} /> {isSaving ? 'Salvando…' : 'Confirmar e salvar'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {isLoading ? (
+          <div className="p-8 text-center text-sm text-slate-400">Carregando programações e escalas diárias…</div>
+        ) : programs.length === 0 ? (
+          <EmptyState message="Importe uma exportação corrigida com matrícula e período aquisitivo para iniciar o plano." />
+        ) : filteredPlanned.length === 0 ? (
+          <EmptyState message="Nenhum período corresponde aos filtros selecionados." />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[1100px] text-sm">
+              <thead className="bg-slate-900/70 text-left text-[10px] uppercase tracking-wide text-slate-400">
+                <tr>
+                  <th className="px-4 py-3">Colaborador / matrícula</th>
+                  <th className="px-4 py-3">Função · plantão</th>
+                  <th className="px-4 py-3">Período aquisitivo</th>
+                  <th className="px-4 py-3">Limite seguro</th>
+                  <th className="px-4 py-3">Dias</th>
+                  <th className="px-4 py-3">Início</th>
+                  <th className="px-4 py-3">Fim</th>
+                  <th className="px-4 py-3">Situação</th>
+                  <th className="px-4 py-3">Observação DP</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-700">
+                {filteredPlanned.map((item) => {
+                  const program = programs.find((candidate) => candidate.id === item.program.id)!;
+                  const employee = employees.find((candidate) => candidate.id === program.employee_id);
+                  const legalLimit = calculateVacationDeadline(program.periodo_aquisitivo_inicio).legalLimit;
+                  const deadlineDays = Math.round((Date.parse(`${program.dt_limite_maxima}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+                  const urgency = deadlineDays <= 30 ? 'critical' : deadlineDays <= 60 ? 'attention' : 'ontime';
+                  const dueWithoutSchedule = (
+                    !program.data_inicio_programada ||
+                    !program.data_fim_programada ||
+                    item.status === 'CONFLITO' ||
+                    item.status === 'BLOQUEADO'
+                  ) && deadlineDays <= 30;
+                  return (
+                    <tr key={program.id} className={`align-top hover:bg-slate-900/30 ${deadlineDays < 0 ? 'bg-rose-950/35' : dueWithoutSchedule ? 'bg-amber-950/20' : ''}`}>
+                      <td className="px-4 py-3">
+                        <p className="font-medium text-slate-100">{employee?.name || 'Colaborador não encontrado'}</p>
+                        <p className="mt-1 text-[11px] text-slate-500">Mat. {employee?.registration || '—'}</p>
+                        <span className={`mt-1 inline-flex rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${program.ajuste_manual_flag ? 'bg-sky-500/15 text-sky-200' : program.data_inicio_programada ? 'bg-violet-500/15 text-violet-200' : 'bg-slate-700 text-slate-400'}`}>
+                          {program.ajuste_manual_flag ? 'Ajuste Manual DP' : program.data_inicio_programada ? 'Sugerido via algoritmo' : 'Sem ajuste manual'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-slate-300">{employee?.role || '—'}<p className="mt-1 text-slate-500">{employee?.shift_group || employee?.shift_type || '—'}</p></td>
+                      <td className="px-4 py-3 text-xs text-slate-300">{program.periodo_aquisitivo_inicio}<p className="mt-1 text-slate-500">até {program.periodo_aquisitivo_fim}</p></td>
+                      <td className={`px-4 py-3 text-xs ${urgency === 'critical' ? 'text-rose-200' : urgency === 'attention' ? 'text-amber-200' : 'text-slate-300'}`}>
+                        <span className="inline-flex items-center gap-1.5">
+                          {urgency === 'critical' && <AlertTriangle size={13} className={deadlineDays < 0 ? 'animate-pulse' : ''} aria-label={deadlineDays < 0 ? 'Prazo vencido' : 'Prazo crítico'} />}
+                          {program.dt_limite_maxima}
+                          <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase ${urgency === 'critical' ? 'bg-rose-500/20 text-rose-200' : urgency === 'attention' ? 'bg-amber-500/20 text-amber-200' : 'bg-emerald-500/10 text-emerald-200'}`}>
+                            {deadlineDays < 0 ? 'Vencido' : urgency === 'critical' ? 'Crítico' : urgency === 'attention' ? 'Atenção' : 'Em dia'}
+                          </span>
+                        </span>
+                        <p className="mt-1 text-slate-500">limite legal: {legalLimit}</p>
+                        {dueWithoutSchedule && <p className="mt-1 font-semibold">{deadlineDays < 0 ? `Vencido há ${Math.abs(deadlineDays)} dia(s)` : `Vence em ${deadlineDays} dia(s) · sem agendamento`}</p>}
+                      </td>
+                      <td className="px-3 py-3">
+                        <input type="number" min="14" max="30" value={program.dias_gozo ?? 30} disabled={!isDp} onChange={(event) => updateProgram(program.id, { dias_gozo: event.target.value ? Number(event.target.value) : 30, data_fim_programada: program.data_inicio_programada && event.target.value ? addCalendarDays(program.data_inicio_programada, Number(event.target.value) - 1) : program.data_fim_programada, ajuste_manual_flag: Boolean(program.data_inicio_programada || program.ajuste_manual_flag) })} className="w-20 rounded-md border border-slate-600 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 disabled:opacity-60" aria-label={`Dias de gozo para ${employee?.name || program.employee_id}`} />
+                      </td>
+                      <td className="px-3 py-3">
+                        <input type="date" value={program.data_inicio_programada || ''} disabled={!isDp} onChange={(event) => updateProgram(program.id, { data_inicio_programada: event.target.value || null, data_fim_programada: event.target.value ? addCalendarDays(event.target.value, program.dias_gozo - 1) : null, ajuste_manual_flag: Boolean(event.target.value) })} className={`w-36 rounded-md border bg-slate-900 px-2 py-1.5 text-xs text-slate-100 disabled:opacity-60 ${item.status === 'CONFLITO' ? 'border-rose-500' : 'border-slate-600'}`} aria-label={`Início programado para ${employee?.name || program.employee_id}`} aria-invalid={item.status === 'CONFLITO'} title={item.message} />
+                      </td>
+                      <td className="px-3 py-3">
+                        <input type="date" value={program.data_fim_programada || ''} disabled={!isDp} onChange={(event) => updateProgram(program.id, { data_fim_programada: event.target.value || null, dias_gozo: program.data_inicio_programada && event.target.value ? inclusiveDays(program.data_inicio_programada, event.target.value) : program.dias_gozo, ajuste_manual_flag: Boolean(event.target.value || program.data_inicio_programada) })} className={`w-36 rounded-md border bg-slate-900 px-2 py-1.5 text-xs text-slate-100 disabled:opacity-60 ${item.status === 'CONFLITO' ? 'border-rose-500' : 'border-slate-600'}`} aria-label={`Fim programado para ${employee?.name || program.employee_id}`} aria-invalid={item.status === 'CONFLITO'} title={item.message} />
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-bold ${item.status === 'PROGRAMADO' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : item.status === 'CONFLITO' || item.status === 'BLOQUEADO' ? 'border-rose-500/30 bg-rose-500/10 text-rose-300' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'}`}>{item.status}</span>
+                        <p className={`mt-1 max-w-64 text-[10px] leading-relaxed ${item.status === 'CONFLITO' ? 'text-rose-200' : 'text-slate-500'}`}>{item.message}</p>
+                      </td>
+                      <td className="px-3 py-3">
+                        <Textarea value={program.observacao_dp} disabled={!isDp} onChange={(event) => updateProgram(program.id, { observacao_dp: event.target.value })} rows={2} className="min-w-40 text-xs" aria-label={`Observação DP para ${employee?.name || program.employee_id}`} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <p className="flex items-start gap-2 px-1 text-xs leading-relaxed text-slate-500">
+        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+        <span>A contagem considera apenas escalas diárias cadastradas como Escalado/Cobertura/Trabalho e afastamentos pendentes ou aprovados. Sem escala diária completa, o resultado fica pendente. Um ajuste manual não ignora a cobertura mínima.</span>
+      </p>
     </div>
   );
 }
