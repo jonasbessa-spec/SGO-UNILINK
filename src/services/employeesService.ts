@@ -22,20 +22,21 @@ function nullableTextValue(row: Record<string, unknown>, ...keys: string[]): str
 
 function mapEmployee(row: Record<string, unknown>): Employee {
   const createdAt = textValue(row, 'created_at', 'criado_em');
+  const hireDate = nullableTextValue(row, 'data_admissao', 'hire_date', 'admissao', 'admissão') || createdAt || null;
 
   return {
     id: textValue(row, 'id'),
-    name: textValue(row, 'nome', 'name'),
-    cpf: nullableTextValue(row, 'cpf'),
+    name: textValue(row, 'nome', 'name') || 'Sem Nome',
+    cpf: nullableTextValue(row, 'cpf') || '',
     registration: textValue(row, 'registration', 'matricula', 'matrícula'),
-    role: textValue(row, 'cargo', 'role', 'funcao', 'função'),
+    role: textValue(row, 'cargo', 'role', 'funcao', 'função') || 'Operador',
     sector: textValue(row, 'sector', 'setor'),
-    shift_group: textValue(row, 'turno', 'shift', 'shift_group', 'plantao', 'plantão'),
+    shift_group: textValue(row, 'turno', 'shift', 'shift_group', 'plantao', 'plantão') || 'Turno A',
     shift_type: textValue(row, 'shift_type', 'tipo_turno') || undefined,
     schedule_start: textValue(row, 'schedule_start', 'horario_inicio', 'hora_inicio'),
     schedule_end: textValue(row, 'schedule_end', 'horario_fim', 'hora_fim'),
     status: textValue(row, 'status', 'situacao', 'situação') || 'Ativo',
-    hire_date: nullableTextValue(row, 'data_admissao', 'hire_date', 'admissao', 'admissão') || createdAt || null,
+    hire_date: hireDate,
     scale_status: textValue(row, 'scale_status', 'status_escala') || 'Em escala',
     notes: textValue(row, 'notes', 'observacoes', 'observações'),
     coordinator: textValue(row, 'coordinator', 'coordenador') || undefined,
@@ -45,7 +46,7 @@ function mapEmployee(row: Record<string, unknown>): Employee {
     vacation_2027: nullableTextValue(row, 'vacation_2027', 'ferias_2027', 'férias_2027'),
     absence_reason: textValue(row, 'absence_reason', 'motivo_ausencia') || undefined,
     is_absent: firstValue(row, 'is_absent', 'ausente') === true,
-    inicio_periodo_aquisitivo: nullableTextValue(row, 'inicio_periodo_aquisitivo', 'period_start'),
+    inicio_periodo_aquisitivo: nullableTextValue(row, 'inicio_periodo_aquisitivo', 'period_start') || hireDate,
     fim_periodo_concessivo: nullableTextValue(row, 'fim_periodo_concessivo', 'period_end'),
     created_at: createdAt,
     updated_at: textValue(row, 'updated_at', 'atualizado_em'),
